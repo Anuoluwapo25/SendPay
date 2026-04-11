@@ -60,7 +60,7 @@ Sendr makes crypto payments as simple as texting.
 
 ### 1. Wallet Connection & Identity
 
-Users connect their existing crypto wallet on their first visit. The wallet acts as the cryptographic backbone of their identity on Sendr — it is the source of truth for who they are and what they own. No new seed phrases, no new accounts to manage.
+Users create their crypto wallet on their first visit. The wallet acts as the cryptographic backbone of their identity on Sendr — it is the source of truth for who they are and what they own. No new seed phrases, no new accounts to manage.
 
 ### 2. Username System
 
