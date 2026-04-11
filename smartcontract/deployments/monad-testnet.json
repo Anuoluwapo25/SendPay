@@ -1,0 +1,20 @@
+{
+  "chainId": 10143,
+  "networkName": "Monad Testnet",
+  "deployedAt": "2026-04-11T09:24:37.765Z",
+  "documentation": "https://docs.monad.xyz/developer-essentials/testnets",
+  "faucet": "https://faucet.monad.xyz",
+  "tokenList": "https://github.com/monad-crypto/token-list/blob/main/tokenlist-testnet.json",
+  "rpcUrl": "https://testnet-rpc.monad.xyz",
+  "usdc": "0x534b2f3A21130d7a60830c2Df862319e593943A3",
+  "deployer": "0x7c13c31fb94fd9ff6f8ef3f409471439d163125a",
+  "contracts": {
+    "UsernameRegistry": "0x1264e8ab9e98e2575856b831e606af43bac0fe65",
+    "GroupRegistry": "0x5008a18adc0f828d1057fb5af7ad9599ff67f62c",
+    "SendrPay": "0x6602f2ee7b05cc382e654bcafbb692bd813f9efa"
+  },
+  "explorers": {
+    "monadVision": "https://testnet.monadvision.com",
+    "monadScan": "https://testnet.monadscan.com"
+  }
+}

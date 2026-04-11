@@ -1,0 +1,27 @@
+{
+  "name": "sendr-contract",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "compile": "hardhat compile",
+    "compile:prod": "hardhat compile --build-profile production",
+    "test": "hardhat test",
+    "deploy:monad-testnet": "npm run compile:prod && hardhat run scripts/deploy-sendr-monad-testnet.ts --network monadTestnet",
+    "verify:monad-testnet": "hardhat verify --network monadTestnet --build-profile production"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "devDependencies": {
+    "@nomicfoundation/hardhat-ignition": "^3.1.1",
+    "@nomicfoundation/hardhat-toolbox-viem": "^5.0.3",
+    "@openzeppelin/contracts": "^5.6.1",
+    "@types/node": "^22.19.17",
+    "dotenv": "^16.4.7",
+    "hardhat": "^3.3.0",
+    "typescript": "~5.8.0",
+    "viem": "^2.47.12"
+  }
+}
