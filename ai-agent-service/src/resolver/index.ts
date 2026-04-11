@@ -1,28 +1,34 @@
 /**
  * Recipient resolver for the WhatsApp webhook flow.
  *
- * Looks up registered users by username from the in-memory DB.
- * When chain mode is active (MONAD_RPC_URL set), you could extend
- * resolveOne to also read from the on-chain UsernameRegistry — for
- * the MVP, the DB is the source of truth (populated at sign-up).
+ * Resolves usernames from the on-chain UsernameRegistry (source of truth).
+ * Groups are resolved from GroupRegistry on-chain.
  */
-import { db } from "../db/index.js";
+import { makePublicClient } from "../chain/client.js";
+import {
+  resolveUsernameOnChain,
+  resolveGroupByNameOnChain,
+} from "../chain/reads.js";
 import type { User, Intent, ResolvedPayment } from "../types.js";
+
+function getClient() {
+  const rpc = process.env.MONAD_RPC_URL?.trim() || process.env.RPC_URL?.trim();
+  if (!rpc) throw new Error("MONAD_RPC_URL is not set.");
+  return makePublicClient(rpc, Number(process.env.MONAD_CHAIN_ID ?? 10143));
+}
 
 // ── Resolve a single username → { username, address } ────────────────────────
 export async function resolveOne(
   raw: string,
 ): Promise<{ username: string; address: string }> {
-  const username = raw.replace("@", "").toLowerCase().trim();
-  if (!username) throw new Error("Empty username provided.");
-
-  const user = await db.getUserByUsername(username);
-  if (!user) {
+  const client = getClient();
+  const result = await resolveUsernameOnChain(client, raw);
+  if (!result.ok) {
     throw new Error(
-      `@${username} is not on LiquiFi yet. Ask them to message this number to sign up.`,
+      `@${result.username} is not registered on SendrPay yet. Ask them to message this number to sign up.`,
     );
   }
-  return { username: user.username, address: user.walletAddress };
+  return { username: result.username, address: result.address };
 }
 
 // ── Resolve all recipients from an Intent ─────────────────────────────────────
@@ -46,7 +52,7 @@ export async function resolveRecipients(
       const names = intent.recipients;
       if (!names?.length) throw new Error("No recipients specified for split payment.");
       const total = intent.totalAmount ?? 0;
-      const per = Math.round((total / names.length) * 100) / 100; // 2 dp
+      const per = Math.round((total / names.length) * 100) / 100;
 
       const resolved = await Promise.all(names.map(resolveOne));
       return {
@@ -58,26 +64,21 @@ export async function resolveRecipients(
 
     case "GROUP_PAYMENT": {
       if (!intent.groupName) throw new Error("No group name specified.");
-      const groups = await db.getGroupsByOwner(sender.phone);
-      const group = groups.find(
-        (g) => g.name.toLowerCase() === intent.groupName!.toLowerCase(),
+      const client = getClient();
+      const result = await resolveGroupByNameOnChain(
+        client,
+        sender.walletAddress as `0x${string}`,
+        intent.groupName,
       );
-      if (!group) {
-        throw new Error(
-          `Group "${intent.groupName}" not found. Type *my groups* to see your groups.`,
-        );
-      }
-      if (!group.members.length) {
-        throw new Error(
-          `Group "${intent.groupName}" has no members yet.`,
-        );
+      if (!result.ok) {
+        throw new Error(result.reason);
       }
       const total = intent.totalAmount ?? 0;
-      const per = Math.round((total / group.members.length) * 100) / 100;
+      const per = Math.round((total / result.members.length) * 100) / 100;
       return {
-        recipients: group.members.map((m) => ({
-          username: m.username,
-          address: m.address,
+        recipients: result.members.map((addr) => ({
+          username: addr,
+          address: addr,
           amount: per,
         })),
         totalAmount: total,

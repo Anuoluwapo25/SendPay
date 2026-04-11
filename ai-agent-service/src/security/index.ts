@@ -1,8 +1,8 @@
 import { db } from "../db/index.js";
 import type { ResolvedPayment, SecurityResult, User } from "../types.js";
 
-const MAX_TX_NAIRA    = parseInt(process.env.MAX_TX_NAIRA ?? "1000000"); // ₦1M
-const WARN_THRESHOLD  = 100_000;  // ₦100k — trigger extra warning
+const MAX_TX_USDC     = parseInt(process.env.MAX_TX_USDC ?? "10000"); // $10,000 USDC
+const WARN_THRESHOLD  = 500;  // $500 USDC — trigger extra warning
 const MAX_RECIPIENTS  = 20;
 const MAX_TXS_PER_MIN = 5;
 
@@ -15,10 +15,10 @@ export async function securityCheck({ resolved, user }: SecurityInput): Promise<
   const { totalAmount, recipients } = resolved;
 
   // 1. Hard block: exceeds absolute limit
-  if (totalAmount > MAX_TX_NAIRA) {
+  if (totalAmount > MAX_TX_USDC) {
     return {
       blocked: true,
-      reason: `Transfer of ₦${totalAmount.toLocaleString()} exceeds the maximum of ₦${MAX_TX_NAIRA.toLocaleString()}.`,
+      reason: `Transfer of $${totalAmount.toLocaleString()} USDC exceeds the maximum of $${MAX_TX_USDC.toLocaleString()} USDC.`,
     };
   }
 
@@ -49,7 +49,7 @@ export async function securityCheck({ resolved, user }: SecurityInput): Promise<
   if (totalAmount >= WARN_THRESHOLD) {
     return {
       blocked: false,
-      warning: `⚠️ Large transfer: ₦${totalAmount.toLocaleString()}. Please double-check before confirming.`,
+      warning: `⚠️ Large transfer: $${totalAmount.toLocaleString()} USDC. Please double-check before confirming.`,
     };
   }
 

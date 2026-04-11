@@ -1,6 +1,5 @@
 import { Router } from "express";
 import type { Request, Response } from "express";
-import { ethers } from "ethers";
 import { parseIntent }                                                        from "../ai/parser.js";
 import { resolveRecipients, resolveOne }                                      from "../resolver/index.js";
 import { buildTxPayload }                                                     from "../coordinator/index.js";
@@ -8,7 +7,19 @@ import { securityCheck }                                                      fr
 import { createPrivyWallet, signAndBroadcast, registerUsernameOnChain }       from "../privy/wallet.js";
 import { sendMessage, sendConfirmButtons, markRead, parseIncoming }           from "../whatsapp/client.js";
 import { db }                                                                 from "../db/index.js";
+import { makePublicClient }                                                   from "../chain/client.js";
+import { readUsdcAddress, resolveUsernameOnChain }                            from "../chain/reads.js";
+import { readErc20Balance }                                                   from "../chain/erc20Reads.js";
+import { checkUsdcReadiness }                                                 from "../chain/usdcReadiness.js";
+import { usdcBaseUnitsFromHuman }                                             from "../chain/usdcAmount.js";
+import { encodeErc20Approve }                                                 from "../chain/encodeErc20.js";
+import { sendrpayContract }                                                   from "../abi/index.js";
 import type { User, Intent, ResolvedPayment, PendingTxData, WebhookBody }    from "../types.js";
+
+function getChainClient() {
+  const rpc = process.env.MONAD_RPC_URL!;
+  return makePublicClient(rpc, Number(process.env.MONAD_CHAIN_ID ?? 10143));
+}
 
 export const webhookRouter = Router();
 
@@ -17,11 +28,17 @@ webhookRouter.get("/", (req: Request, res: Response) => {
   const token     = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
 
-  if (mode === "subscribe" && token === process.env.WEBHOOK_VERIFY_TOKEN) {
-    console.log("✅ Meta webhook verified");
-    return res.status(200).send(challenge);
+  // Meta webhook verification
+  if (mode || token) {
+    if (mode === "subscribe" && token === process.env.WEBHOOK_VERIFY_TOKEN) {
+      console.log("✅ Meta webhook verified");
+      return res.status(200).send(challenge);
+    }
+    return res.sendStatus(403);
   }
-  return res.sendStatus(403);
+
+  // Direct browser visit — health check
+  return res.status(200).json({ status: "ok", message: "SendPay webhook is live ✅" });
 });
 
 
@@ -79,38 +96,61 @@ webhookRouter.post("/", async (req: Request, res: Response) => {
 async function handleOnboarding(phone: string, text: string, name: string | null): Promise<void> {
   const session = await db.getSession(phone);
 
-  // Step 1 — first contact ever
+  // Step 1 — first contact: create wallet immediately, show address + faucet
   if (!session) {
-    await db.setSession(phone, { step: "AWAIT_USERNAME" });
     const greeting = name ? `👋 Hey *${name}*!` : "👋 Hey!";
+    await sendMessage(phone, `${greeting} Welcome to *SendrPay* ⚡\n\n⏳ Creating your Monad wallet...`);
+
+    const wallet = await createPrivyWallet(phone);
+
+    // Save wallet in session so Step 2 can use it without another Privy call
+    await db.setSession(phone, {
+      step: "AWAIT_USERNAME",
+      walletAddress: wallet.address,
+      walletId: wallet.id,
+    });
+
     await sendMessage(phone,
-      `${greeting} Welcome to *LiquiFi* ⚡\n\nSend money on Monad just by chatting — no apps, no addresses.\n\nFirst, pick your *@username*:\n_(3–20 chars, letters/numbers/underscore)_\n\nExample: reply *@tolu*`
+      `✅ *Your wallet is ready!*\n\n` +
+      `💳 Address: \`${wallet.address}\`\n\n` +
+      `⛽ *You need testnet MON for gas fees.*\n` +
+      `Get it free here 👉 https://faucet.monad.xyz\n\n` +
+      `Once you have MON, reply with your desired *@username*:\n` +
+      `_(3–32 chars, letters)_\n\n` +
+      `Example: *@tolu*`
     );
     return;
   }
 
-  // Step 2 — waiting for username choice
+  // Step 2 — user replies with username: validate + register on-chain
   if (session.step === "AWAIT_USERNAME") {
-    const raw = text.startsWith("@") ? text.slice(1) : text;
-    const username = raw.toLowerCase().replace(/[^a-z0-9_]/g, "");
+    const raw      = text.startsWith("@") ? text.slice(1) : text;
+    const username = raw.toLowerCase().replace(/[^a-z0-9]/g, "");
 
     if (username.length < 3) {
-      await sendMessage(phone, " Too short — at least 3 characters. Try again:");
+      await sendMessage(phone, "❌ Too short — at least 3 characters. Try again:");
       return;
     }
-    if (username.length > 20) {
-      await sendMessage(phone, " Too long — max 20 characters. Try again:");
-      return;
-    }
-
-    const taken = await db.isUsernameTaken(username);
-    if (taken) {
-      await sendMessage(phone, ` *@${username}* is already taken. Try another:`);
+    if (username.length > 32) {
+      await sendMessage(phone, "❌ Too long — max 32 characters. Try again:");
       return;
     }
 
-    // Create Privy server wallet
-    await sendMessage(phone, "⏳ Creating your wallet on Monad...");
+    // Check in-memory first (fast), then on-chain (authoritative)
+    const takenLocally = await db.isUsernameTaken(username);
+    if (takenLocally) {
+      await sendMessage(phone, `❌ *@${username}* is already taken. Try another:`);
+      return;
+    }
+
+    const client      = getChainClient();
+    const onChainUser = await resolveUsernameOnChain(client, username);
+    if (onChainUser.ok) {
+      await sendMessage(phone, `❌ *@${username}* is already registered. Try another:`);
+      return;
+    }
+
+    // Retrieve wallet created in Step 1 (idempotent — safe to call again)
     const wallet = await createPrivyWallet(phone);
 
     // Save user to DB
@@ -121,21 +161,33 @@ async function handleOnboarding(phone: string, text: string, name: string | null
       privyWalletId: wallet.id,
     });
 
-    // Register username on-chain (async — don't block the welcome message)
-    registerUsernameOnChain(phone, username, wallet.address)
-      .then(hash => console.log(` Username @${username} registered on-chain: ${hash}`))
-      .catch(err => console.error(`On-chain username registration failed:`, err));
+    // Register username on-chain and wait for confirmation
+    await sendMessage(phone, `⏳ Registering *@${username}* on-chain...`);
+    try {
+      const regHash = await registerUsernameOnChain(phone, username, wallet.address);
+      await client.waitForTransactionReceipt({ hash: regHash as `0x${string}` });
+      console.log(`✅ @${username} registered on-chain: ${regHash}`);
+    } catch (err) {
+      console.error(`On-chain registration failed for @${username}:`, err);
+      await sendMessage(phone,
+        `❌ Registration failed: ${(err as Error).message}\n\n` +
+        `Make sure your wallet has testnet MON for gas.\n` +
+        `Faucet: https://faucet.monad.xyz\n\n` +
+        `Then reply with your username again to retry.`
+      );
+      return;
+    }
 
     await db.clearSession(phone);
 
     await sendMessage(phone,
       `✅ *@${username}* is yours!\n\n` +
-      `💳 Wallet: \`${wallet.address}\`\n` +
+      `💳 Wallet: \`${wallet.address}\`\n\n` +
       `*Try these commands:*\n` +
-      `• "Send ₦2000 to @ada"\n` +
-      `• "Split ₦10k among @tolu @ada @john"\n` +
+      `• "Send $20 USDC to @ada"\n` +
+      `• "Split $100 USDC among @tolu @ada @john"\n` +
       `• "Create group Friends with @tolu @ada"\n` +
-      `• "Send ₦2k to Friends group"\n` +
+      `• "Send $50 USDC to Friends group"\n` +
       `• "My balance"\n` +
       `━━━━━━━━━━━━━━━━━━━━`
     );
@@ -200,7 +252,7 @@ async function handleCommand(phone: string, text: string, user: User): Promise<v
     // Ask who to split with
     await db.setSession(phone, { step: "AWAIT_SPLIT_NAMES", intent });
     await sendMessage(phone,
-      `You want to split *₦${intent.totalAmount!.toLocaleString()}* among *${intent.count}* people.\n\nWho should I split with? Reply with usernames:\ne.g. "@tolu @ada @john"`
+      `You want to split *$${intent.totalAmount!.toLocaleString()} USDC* among *${intent.count}* people.\n\nWho should I split with? Reply with usernames:\ne.g. "@tolu @ada @john"`
     );
     return;
   }
@@ -230,6 +282,27 @@ async function handleCommand(phone: string, text: string, user: User): Promise<v
 
   // Build tx payload
   const txPayload = buildTxPayload(resolved, user.walletAddress);
+
+  // ── USDC balance check ────────────────────────────────────────────────────
+  try {
+    const client      = getChainClient();
+    const usdcAddress = await readUsdcAddress(client);
+    const required    = usdcBaseUnitsFromHuman(resolved.totalAmount);
+    const balance     = await readErc20Balance(client, usdcAddress, user.walletAddress as `0x${string}`);
+
+    if (balance < required) {
+      const has  = (Number(balance)   / 1_000_000).toFixed(2);
+      const need = (Number(required)  / 1_000_000).toFixed(2);
+      await sendMessage(phone,
+        `❌ *Insufficient USDC*\n\n` +
+        `This payment needs *$${need} USDC* but your wallet only has *$${has} USDC*.\n\n` +
+        `Top up your wallet and try again.`
+      );
+      return;
+    }
+  } catch (err) {
+    console.warn("USDC balance check failed (proceeding anyway):", (err as Error).message);
+  }
 
   // Store pending tx
   await db.setPendingTx(phone, { txPayload, resolved, intent, createdAt: Date.now() });
@@ -262,6 +335,52 @@ async function handleConfirmation(phone: string, confirmed: boolean): Promise<vo
     return;
   }
 
+  // ── USDC readiness check: auto-approve if allowance is too low ───────────
+  const user = await db.getUserByPhone(phone);
+  if (user) {
+    try {
+      const client      = getChainClient();
+      const usdcAddress = await readUsdcAddress(client);
+      const required    = usdcBaseUnitsFromHuman(pending.resolved.totalAmount);
+      const readiness   = await checkUsdcReadiness(
+        client,
+        usdcAddress,
+        user.walletAddress as `0x${string}`,
+        sendrpayContract.address,
+        required,
+      );
+
+      if (!readiness.ok) {
+        if (readiness.reason === "insufficient_balance") {
+          const has  = (Number(readiness.balance)  / 1_000_000).toFixed(2);
+          const need = (Number(readiness.required) / 1_000_000).toFixed(2);
+          await sendMessage(phone,
+            `❌ *Insufficient USDC*\n\nThis payment needs *$${need} USDC* but your balance is *$${has} USDC*.\n\nTransaction cancelled.`
+          );
+          return;
+        }
+
+        if (readiness.reason === "insufficient_allowance") {
+          await sendMessage(phone, "🔐 Approving SendrPay to spend your USDC...");
+          try {
+            const approveCall = encodeErc20Approve(usdcAddress, sendrpayContract.address, required);
+            const approveHash = await signAndBroadcast(phone, {
+              to: approveCall.to, data: approveCall.data, value: approveCall.value,
+            });
+            // Wait for approval to be confirmed before sending payment
+            await client.waitForTransactionReceipt({ hash: approveHash as `0x${string}` });
+            console.log(`✅ USDC approved for ${user.username}: ${approveHash}`);
+          } catch (err) {
+            await sendMessage(phone, `❌ Approval failed: ${(err as Error).message}\n\nNo funds were moved.`);
+            return;
+          }
+        }
+      }
+    } catch (err) {
+      console.warn("USDC readiness check failed (proceeding anyway):", (err as Error).message);
+    }
+  }
+
   // Execute
   await sendMessage(phone, "⏳ Signing and broadcasting on Monad...");
 
@@ -270,7 +389,7 @@ async function handleConfirmation(phone: string, confirmed: boolean): Promise<vo
     txHash = await signAndBroadcast(phone, pending.txPayload);
   } catch (err) {
     console.error("Privy signing error:", err);
-    await sendMessage(phone, ` Transaction failed to broadcast.\n\nError: ${(err as Error).message}\n\nNo funds were moved.`);
+    await sendMessage(phone, `❌ Transaction failed to broadcast.\n\nError: ${(err as Error).message}\n\nNo funds were moved.`);
     return;
   }
 
@@ -285,7 +404,7 @@ async function handleConfirmation(phone: string, confirmed: boolean): Promise<vo
 
   // Success message
   const recipientLines = pending.resolved.recipients
-    .map(r => `  • ${r.username} — ₦${r.amount.toLocaleString()}`)
+    .map(r => `  • ${r.username} — $${r.amount.toLocaleString()} USDC`)
     .join("\n");
 
   const note = pending.resolved.note ? `\n📝 _"${pending.resolved.note}"_` : "";
@@ -293,7 +412,7 @@ async function handleConfirmation(phone: string, confirmed: boolean): Promise<vo
   await sendMessage(phone,
     `✅ *Done! Payment sent.*\n\n` +
     `${recipientLines}${note}\n\n` +
-    `💰 Total: *₦${pending.resolved.totalAmount.toLocaleString()}*\n` +
+    `💰 Total: *$${pending.resolved.totalAmount.toLocaleString()} USDC*\n` +
     `🔗 Tx: \`${txHash.slice(0, 10)}...${txHash.slice(-6)}\`\n` +
     `🌐 Network: Monad Testnet ⚡\n\n` +
     `View: https://testnet.monadexplorer.com/tx/${txHash}`
@@ -334,7 +453,7 @@ async function handleCreateGroup(phone: string, user: User, intent: Intent): Pro
 
   const memberList = members.map(m => `  • ${m.username}`).join("\n");
   await sendMessage(phone,
-    `✅ Group *"${intent.name}"* created!\n\nMembers:\n${memberList}\n\nNow try:\n• "Send ₦2k to ${intent.name} group"\n• "Split ₦10k among ${intent.name} group"`
+    `✅ Group *"${intent.name}"* created!\n\nMembers:\n${memberList}\n\nNow try:\n• "Send $50 USDC to ${intent.name} group"\n• "Split $100 USDC among ${intent.name} group"`
   );
 }
 
@@ -397,14 +516,15 @@ async function handleListGroups(phone: string, _user: User): Promise<void> {
 // BALANCE + HISTORY
 // ═════════════════════════════════════════════════════════════════════════════
 async function handleBalance(phone: string, user: User): Promise<void> {
-  const provider = new ethers.JsonRpcProvider(process.env.MONAD_RPC_URL);
+  const rpc = process.env.MONAD_RPC_URL!;
+  const client = makePublicClient(rpc, Number(process.env.MONAD_CHAIN_ID ?? 10143));
 
   let balanceText = "(could not fetch)";
   try {
-    const raw = await provider.getBalance(user.walletAddress);
-    const mon = parseFloat(ethers.formatEther(raw)).toFixed(4);
-    const naira = Math.round(parseFloat(mon) * parseInt(process.env.NAIRA_PER_MON ?? "2000"));
-    balanceText = `*${mon} MON* ≈ ₦${naira.toLocaleString()}`;
+    const usdcAddress = await readUsdcAddress(client);
+    const raw = await readErc20Balance(client, usdcAddress, user.walletAddress as `0x${string}`);
+    const usdc = (Number(raw) / 1_000_000).toFixed(2);
+    balanceText = `*${usdc} USDC*`;
   } catch { /* RPC down — show address anyway */ }
 
   await sendMessage(phone,
@@ -412,7 +532,7 @@ async function handleBalance(phone: string, user: User): Promise<void> {
     `Balance: ${balanceText}\n` +
     `Address: \`${user.walletAddress}\`\n` +
     `Network: Monad Testnet ⚡\n\n` +
-    `Get testnet MON: https://faucet.monad.xyz`
+    `Get testnet USDC from the faucet to start sending.`
   );
 }
 
@@ -420,14 +540,14 @@ async function handleHistory(phone: string, _user: User): Promise<void> {
   const txs = await db.getTxHistory(phone, 5);
 
   if (txs.length === 0) {
-    await sendMessage(phone, "You have no transactions yet.\n\nTry: \"Send ₦2000 to @tolu\"");
+    await sendMessage(phone, "You have no transactions yet.\n\nTry: \"Send $20 USDC to @tolu\"");
     return;
   }
 
   const lines = txs.map((tx, i) => {
     const date = new Date(tx.timestamp).toLocaleDateString("en-GB", { day: "numeric", month: "short" });
     const to   = tx.resolved.recipients.map(r => r.username).join(", ");
-    return `${i + 1}. ₦${tx.resolved.totalAmount.toLocaleString()} → ${to} · ${date} · ${tx.status === "confirmed" ? "✅" : tx.status === "failed" ? "❌" : "⏳"}`;
+    return `${i + 1}. $${tx.resolved.totalAmount.toLocaleString()} USDC → ${to} · ${date} · ${tx.status === "confirmed" ? "✅" : tx.status === "failed" ? "❌" : "⏳"}`;
   });
 
   await sendMessage(phone, `📜 *Recent Transactions*\n\n${lines.join("\n")}`);
@@ -438,7 +558,7 @@ async function handleHistory(phone: string, _user: User): Promise<void> {
 // ═════════════════════════════════════════════════════════════════════════════
 function buildConfirmText(resolved: ResolvedPayment, _intent: Intent, warning: string | null): string {
   const recipientLines = resolved.recipients
-    .map(r => `  • ${r.username} — ₦${r.amount.toLocaleString()}`)
+    .map(r => `  • ${r.username} — $${r.amount.toLocaleString()} USDC`)
     .join("\n");
 
   const note    = resolved.note ? `\n📝 "${resolved.note}"` : "";
@@ -447,7 +567,7 @@ function buildConfirmText(resolved: ResolvedPayment, _intent: Intent, warning: s
   return (
     ` *Confirm Payment*\n\n` +
     `${recipientLines}${note}\n\n` +
-    ` Total: *₦${resolved.totalAmount.toLocaleString()}*\n` +
+    ` Total: *$${resolved.totalAmount.toLocaleString()} USDC*\n` +
     ` Network: Monad Testnet${warnStr}\n\n` +
     `Transactions on Monad are *irreversible*.`
   );
@@ -457,14 +577,14 @@ async function sendHelp(phone: string, user: User): Promise<void> {
   await sendMessage(phone,
     `🤖 *Sendpay — Command Guide*\n\n` +
     `*Send money:*\n` +
-    `• "Send ₦2000 to @tolu"\n` +
-    `• "Send ₦5k to @ada for rent"\n\n` +
+    `• "Send $20 USDC to @tolu"\n` +
+    `• "Send $50 USDC to @ada for rent"\n\n` +
     `*Split bills:*\n` +
-    `• "Split ₦10k with @tolu @ada @john"\n` +
-    `• "Split ₦10k among 4 people"\n\n` +
+    `• "Split $100 USDC with @tolu @ada @john"\n` +
+    `• "Split $100 USDC among 4 people"\n\n` +
     `*Groups:*\n` +
     `• "Create group Friends with @tolu @ada"\n` +
-    `• "Send ₦2k to Friends group"\n` +
+    `• "Send $50 USDC to Friends group"\n` +
     `• "Add @john to Friends group"\n` +
     `• "My groups"\n\n` +
     `*Account:*\n` +

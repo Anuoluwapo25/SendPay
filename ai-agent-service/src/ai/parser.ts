@@ -12,7 +12,7 @@ import type { Intent } from "../types.js";
 
 const GROQ_BASE_URL = "https://api.groq.com/openai/v1";
 
-const SYSTEM = `You are a WhatsApp payment assistant intent parser for an app called LiquiFi on Monad.
+const SYSTEM = `You are a WhatsApp payment assistant intent parser for an app called SendrPay on Monad.
 Output ONLY valid JSON matching exactly one of these shapes (no markdown, no extra keys):
 
 Payment:
@@ -35,8 +35,8 @@ Group management:
 Rules:
 - Strip "@" from usernames in the JSON output.
 - Usernames are lowercase letters, numbers, underscores only.
-- Amounts are USDC. Nigerian Naira (₦) or Naira amounts: treat the number as the USDC value directly for now.
-- "k" suffix means × 1000: "2k" = 2000, "₦10k" = 10000.
+- All amounts are in USDC (e.g. "$20 USDC", "20 USDC", "20" all mean 20 USDC).
+- "k" suffix means × 1000: "2k" = 2000, "10k" = 10000.
 - If the message is unclear or unrelated, return: {"action":"HELP"}`;
 
 // ── Rule-based fast path ──────────────────────────────────────────────────────
@@ -104,8 +104,8 @@ function ruleParse(text: string): Intent | null {
     };
   }
 
-  // "send ₦2000 to @tolu [for rent]"
-  const sendSingle = lower.match(/send\s+[₦$]?\s*([\d,.]+k?)\s+to\s+@?(\w+)(?:\s+for\s+(.+))?/);
+  // "send $20 USDC to @tolu [for rent]"
+  const sendSingle = lower.match(/send\s+[$]?\s*([\d,.]+k?)\s+(?:usdc\s+)?to\s+@?(\w+)(?:\s+for\s+(.+))?/);
   if (sendSingle) {
     const amount = parseMoneyAmount(sendSingle[1]!);
     if (amount) {
@@ -118,8 +118,8 @@ function ruleParse(text: string): Intent | null {
     }
   }
 
-  // "send ₦2k to Friends group"
-  const sendGroup = lower.match(/send\s+[₦$]?\s*([\d,.]+k?)\s+to\s+(?:the\s+)?(.+?)\s+group\b/);
+  // "send $50 USDC to Friends group"
+  const sendGroup = lower.match(/send\s+[$]?\s*([\d,.]+k?)\s+(?:usdc\s+)?to\s+(?:the\s+)?(.+?)\s+group\b/);
   if (sendGroup) {
     const amount = parseMoneyAmount(sendGroup[1]!);
     if (amount) {
@@ -131,8 +131,8 @@ function ruleParse(text: string): Intent | null {
     }
   }
 
-  // "split ₦10k with @tolu @ada @john"
-  const splitWith = lower.match(/split\s+[₦$]?\s*([\d,.]+k?)\s+(?:with|among|between)\s+(.+)/);
+  // "split $100 USDC with @tolu @ada @john"
+  const splitWith = lower.match(/split\s+[$]?\s*([\d,.]+k?)\s+(?:usdc\s+)?(?:with|among|between)\s+(.+)/);
   if (splitWith) {
     const amount = parseMoneyAmount(splitWith[1]!);
     const users = extractUsernames(splitWith[2]!);

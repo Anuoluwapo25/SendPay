@@ -14,7 +14,7 @@ import type {
   TxHistoryItem,
 } from "../types.js";
 
-type OnboardingSession = { step: "AWAIT_USERNAME" | string; intent?: Intent };
+type OnboardingSession = { step: "AWAIT_USERNAME" | string; intent?: Intent; walletAddress?: string; walletId?: string };
 
 // ── In-memory stores ──────────────────────────────────────────────────────────
 const users          = new Map<string, User>();              // phone → User

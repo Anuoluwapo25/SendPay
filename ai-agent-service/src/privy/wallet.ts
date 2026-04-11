@@ -1,6 +1,8 @@
 import { PrivyClient } from "@privy-io/server-auth";
 import { db } from "../db/index.js";
 import type { TxPayload, PrivyWallet } from "../types.js";
+import { encodeRegisterUsername } from "../chain/encodeUserRegistry.js";
+import { normalizeUsernameForRegistry } from "../chain/normalizeUsername.js";
 
 // @privy-io/server-auth v1: positional (appId, appSecret) constructor
 const privy = new PrivyClient(
@@ -51,7 +53,7 @@ export async function signAndBroadcast(
 }
 
 // ── Register username on-chain after signup ───────────────────────────────────
-// The user's Privy wallet calls UsernameRegistry.registerUsername()
+// The user's Privy wallet calls UsernameRegistry.register()
 export async function registerUsernameOnChain(
   phone: string,
   username: string,
@@ -60,21 +62,18 @@ export async function registerUsernameOnChain(
   const walletId = await db.getPrivyWalletId(phone);
   if (!walletId) throw new Error("No wallet found.");
 
-  const { ethers } = await import("ethers");
+  const norm = normalizeUsernameForRegistry(username);
+  if (!norm.ok) throw new Error(norm.reason);
 
-  const REGISTRY_ABI = [
-    "function registerUsername(string calldata username) external",
-  ];
-  const iface = new ethers.Interface(REGISTRY_ABI);
-  const data = iface.encodeFunctionData("registerUsername", [username]);
+  const encoded = encodeRegisterUsername(norm.name);
 
   const { hash } = await privy.walletApi.ethereum.sendTransaction({
     walletId,
     caip2: CAIP2,
     transaction: {
-      to:    process.env.USERNAME_REGISTRY_ADDRESS! as `0x${string}`,
-      data:  data as `0x${string}`,
-      value: "0x0" as `0x${string}`,
+      to:    encoded.to,
+      data:  encoded.data,
+      value: encoded.value as `0x${string}`,
     },
   });
 
