@@ -31,7 +31,7 @@ export async function getPrivyWalletId(phone: string): Promise<string | null> {
 
 // ── Sign and broadcast a transaction ─────────────────────────────────────────
 // Called ONLY after user replies YES in WhatsApp.
-// Privy handles: nonce, gas estimation, RPC broadcast, retry on underpriced.
+// If txPayload.gasLimit is set we pass it explicitly; otherwise Privy estimates.
 export async function signAndBroadcast(
   phone: string,
   txPayload: TxPayload,
@@ -45,7 +45,10 @@ export async function signAndBroadcast(
     transaction: {
       to:    txPayload.to    as `0x${string}`,
       data:  txPayload.data  as `0x${string}`,
-      value: txPayload.value as `0x${string}`, // hex string wei
+      value: txPayload.value as `0x${string}`,
+      ...(txPayload.gasLimit           !== undefined && { gasLimit:           `0x${txPayload.gasLimit.toString(16)}`           as `0x${string}` }),
+      ...(txPayload.maxFeePerGas       !== undefined && { maxFeePerGas:       `0x${txPayload.maxFeePerGas.toString(16)}`       as `0x${string}` }),
+      ...(txPayload.maxPriorityFeePerGas !== undefined && { maxPriorityFeePerGas: `0x${txPayload.maxPriorityFeePerGas.toString(16)}` as `0x${string}` }),
     },
   });
 
@@ -58,6 +61,7 @@ export async function registerUsernameOnChain(
   phone: string,
   username: string,
   _walletAddress: string,
+  gasOverrides?: Pick<TxPayload, "gasLimit" | "maxFeePerGas" | "maxPriorityFeePerGas">,
 ): Promise<string> {
   const walletId = await db.getPrivyWalletId(phone);
   if (!walletId) throw new Error("No wallet found.");
@@ -74,6 +78,9 @@ export async function registerUsernameOnChain(
       to:    encoded.to,
       data:  encoded.data,
       value: encoded.value as `0x${string}`,
+      ...(gasOverrides?.gasLimit           !== undefined && { gasLimit:           `0x${gasOverrides.gasLimit.toString(16)}`           as `0x${string}` }),
+      ...(gasOverrides?.maxFeePerGas       !== undefined && { maxFeePerGas:       `0x${gasOverrides.maxFeePerGas.toString(16)}`       as `0x${string}` }),
+      ...(gasOverrides?.maxPriorityFeePerGas !== undefined && { maxPriorityFeePerGas: `0x${gasOverrides.maxPriorityFeePerGas.toString(16)}` as `0x${string}` }),
     },
   });
 

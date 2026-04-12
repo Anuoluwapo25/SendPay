@@ -10,7 +10,7 @@
  *                     split the payment or use on-chain group functionality.
  */
 import type { ResolvedPayment, TxPayload } from "../types.js";
-import { encodePay } from "../chain/encodeSendrPay.js";
+import { encodePay, encodePayGroupEqual } from "../chain/encodeSendrPay.js";
 import { usdcBaseUnitsFromHuman } from "../chain/usdcAmount.js";
 
 export function buildTxPayload(
@@ -30,11 +30,17 @@ export function buildTxPayload(
     return { to: call.to, data: call.data, value: call.value };
   }
 
-  // Multi-recipient payments require multiple transactions or a batch contract.
-  // Guide the user toward a workaround.
+  // On-chain group payment → single payGroupEqual tx
+  if (resolved.groupId !== undefined) {
+    const perMember = usdcBaseUnitsFromHuman(resolved.recipients[0]!.amount);
+    const call = encodePayGroupEqual(resolved.groupId, perMember);
+    return { to: call.to, data: call.data, value: call.value };
+  }
+
+  // Named split (no on-chain group) — not supported as a single tx
   throw new Error(
-    `Paying ${resolved.recipients.length} people at once requires multiple transactions — ` +
-      `not yet supported in a single WhatsApp confirmation. ` +
-      `Please send to each person individually, or create a group and use "Send $X to <group> group".`,
+    `Splitting among ${resolved.recipients.length} people requires an on-chain group. ` +
+      `Create one first: "Create group <name> with @user1 @user2", ` +
+      `then: "Send $X to <name> group".`,
   );
 }

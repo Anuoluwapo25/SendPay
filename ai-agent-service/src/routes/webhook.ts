@@ -8,17 +8,57 @@ import { createPrivyWallet, signAndBroadcast, registerUsernameOnChain }       fr
 import { sendMessage, sendConfirmButtons, markRead, parseIncoming }           from "../whatsapp/client.js";
 import { db }                                                                 from "../db/index.js";
 import { makePublicClient }                                                   from "../chain/client.js";
-import { readUsdcAddress, resolveUsernameOnChain }                            from "../chain/reads.js";
-import { readErc20Balance }                                                   from "../chain/erc20Reads.js";
+import { readUsdcAddress, resolveUsernameOnChain, getRegisteredUsernameForAddress, resolveGroupByNameOnChain, formatGroupsLinesForWallet } from "../chain/reads.js";
+import { readErc20Balance, readErc20Allowance }                               from "../chain/erc20Reads.js";
 import { checkUsdcReadiness }                                                 from "../chain/usdcReadiness.js";
 import { usdcBaseUnitsFromHuman }                                             from "../chain/usdcAmount.js";
 import { encodeErc20Approve }                                                 from "../chain/encodeErc20.js";
-import { sendrpayContract }                                                   from "../abi/index.js";
+import { encodeRegisterUsername }                                             from "../chain/encodeUserRegistry.js";
+import { normalizeUsernameForRegistry }                                       from "../chain/normalizeUsername.js";
+import { encodeCreateGroup, encodeAddMember, encodeRemoveMember }            from "../chain/encodeGroupRegistry.js";
+import { sendrpayContract, groupRegistryContract }                           from "../abi/index.js";
+import { maxUint256 }                                                         from "viem";
 import type { User, Intent, ResolvedPayment, PendingTxData, WebhookBody }    from "../types.js";
 
 function getChainClient() {
   const rpc = process.env.MONAD_RPC_URL!;
   return makePublicClient(rpc, Number(process.env.MONAD_CHAIN_ID ?? 10143));
+}
+
+type GasParams = {
+  gasLimit: bigint;
+  maxFeePerGas: bigint;
+  maxPriorityFeePerGas: bigint;
+};
+
+/**
+ * Estimate gas limit + EIP-1559 fee params for a call using OUR Monad RPC.
+ * This prevents Privy from applying incorrect mainnet-level gas prices to Monad txs.
+ */
+async function getGasParams(
+  from: `0x${string}`,
+  call: { to: `0x${string}`; data: `0x${string}`; value?: bigint },
+): Promise<GasParams | null> {
+  try {
+    const client = getChainClient();
+    const [gasEst, fees] = await Promise.all([
+      client.estimateGas({
+        account: from,
+        to:      call.to,
+        data:    call.data,
+        value:   call.value ?? 0n,
+      }),
+      client.estimateFeesPerGas(),
+    ]);
+    return {
+      gasLimit:             (gasEst * 130n) / 100n,            // 30% buffer
+      maxFeePerGas:         fees.maxFeePerGas         ?? 0n,
+      maxPriorityFeePerGas: fees.maxPriorityFeePerGas ?? 0n,
+    };
+  } catch (err) {
+    console.warn("getGasParams failed (Privy will estimate):", (err as Error).message);
+    return null;
+  }
 }
 
 export const webhookRouter = Router();
@@ -96,27 +136,89 @@ webhookRouter.post("/", async (req: Request, res: Response) => {
 async function handleOnboarding(phone: string, text: string, name: string | null): Promise<void> {
   const session = await db.getSession(phone);
 
-  // Step 1 — first contact: create wallet immediately, show address + faucet
+  // ── Step 0: auto-restore if wallet already has an on-chain username ──────────
+  // Fires on first contact (no session) AND when re-entering onboarding mid-flow.
+  // Privy's idempotencyKey guarantees the same wallet address every time.
+  const walletForCheck = await createPrivyWallet(phone);
+  const client         = getChainClient();
+  const existingUsername = await getRegisteredUsernameForAddress(
+    client,
+    walletForCheck.address as `0x${string}`,
+  );
+
+  if (existingUsername === "REGISTERED_UNKNOWN") {
+    // Wallet is on-chain registered but event query couldn't retrieve the name.
+    // Ask the user to confirm their username so we can verify it on-chain.
+    if (!session || session.step !== "AWAIT_USERNAME_RECOVERY") {
+      await db.setSession(phone, {
+        step: "AWAIT_USERNAME_RECOVERY",
+        walletAddress: walletForCheck.address,
+        walletId: walletForCheck.id,
+      });
+      await sendMessage(phone,
+        `👋 Welcome back! Your wallet is already registered on SendrPay.\n\n` +
+        `What is your *@username*? Reply with it so I can restore your account:`
+      );
+    } else {
+      // User is replying with their username for recovery
+      const raw      = text.startsWith("@") ? text.slice(1) : text;
+      const username = raw.toLowerCase().replace(/[^a-z0-9]/g, "");
+      const check    = await resolveUsernameOnChain(client, username);
+      if (!check.ok || check.address.toLowerCase() !== walletForCheck.address.toLowerCase()) {
+        await sendMessage(phone, `❌ *@${username}* doesn't match your wallet. Try again:`);
+        return;
+      }
+      await db.createUser({ phone, username, walletAddress: walletForCheck.address, privyWalletId: walletForCheck.id });
+      await db.clearSession(phone);
+      await sendMessage(phone,
+        `✅ Welcome back, *@${username}*!\n\n` +
+        `💳 Wallet: \`${walletForCheck.address}\`\n\n` +
+        `*Try:*\n• "Send $20 USDC to @ada"\n• "My balance"\n• "Help"`
+      );
+    }
+    return;
+  }
+
+  if (existingUsername) {
+    // Wallet already registered on-chain — restore user to DB silently
+    await db.createUser({
+      phone,
+      username:      existingUsername,
+      walletAddress: walletForCheck.address,
+      privyWalletId: walletForCheck.id,
+    });
+    await db.clearSession(phone);
+    await sendMessage(phone,
+      `✅ Welcome back, *@${existingUsername}*!\n\n` +
+      `💳 Wallet: \`${walletForCheck.address}\`\n\n` +
+      `*Try these commands:*\n` +
+      `• "Send $20 USDC to @ada"\n` +
+      `• "My balance"\n` +
+      `• "Help"`
+    );
+    return;
+  }
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  // Step 1 — first contact: show wallet address + faucet, ask for username
   if (!session) {
     const greeting = name ? `👋 Hey *${name}*!` : "👋 Hey!";
-    await sendMessage(phone, `${greeting} Welcome to *SendrPay* ⚡\n\n⏳ Creating your Monad wallet...`);
-
-    const wallet = await createPrivyWallet(phone);
+    await sendMessage(phone, `${greeting} Welcome to *SendrPay* ⚡\n\n⏳ Setting up your Monad wallet...`);
 
     // Save wallet in session so Step 2 can use it without another Privy call
     await db.setSession(phone, {
       step: "AWAIT_USERNAME",
-      walletAddress: wallet.address,
-      walletId: wallet.id,
+      walletAddress: walletForCheck.address,
+      walletId: walletForCheck.id,
     });
 
     await sendMessage(phone,
       `✅ *Your wallet is ready!*\n\n` +
-      `💳 Address: \`${wallet.address}\`\n\n` +
+      `💳 Address: \`${walletForCheck.address}\`\n\n` +
       `⛽ *You need testnet MON for gas fees.*\n` +
       `Get it free here 👉 https://faucet.monad.xyz\n\n` +
       `Once you have MON, reply with your desired *@username*:\n` +
-      `_(3–32 chars, letters)_\n\n` +
+      `_(3–32 chars, letters and numbers only)_\n\n` +
       `Example: *@tolu*`
     );
     return;
@@ -142,16 +244,13 @@ async function handleOnboarding(phone: string, text: string, name: string | null
       await sendMessage(phone, `❌ *@${username}* is already taken. Try another:`);
       return;
     }
-
-    const client      = getChainClient();
     const onChainUser = await resolveUsernameOnChain(client, username);
     if (onChainUser.ok) {
       await sendMessage(phone, `❌ *@${username}* is already registered. Try another:`);
       return;
     }
 
-    // Retrieve wallet created in Step 1 (idempotent — safe to call again)
-    const wallet = await createPrivyWallet(phone);
+    const wallet = walletForCheck; // already fetched above
 
     // Save user to DB
     await db.createUser({
@@ -164,8 +263,23 @@ async function handleOnboarding(phone: string, text: string, name: string | null
     // Register username on-chain and wait for confirmation
     await sendMessage(phone, `⏳ Registering *@${username}* on-chain...`);
     try {
-      const regHash = await registerUsernameOnChain(phone, username, wallet.address);
-      await client.waitForTransactionReceipt({ hash: regHash as `0x${string}` });
+      // Estimate gas using our Monad RPC so Privy doesn't apply wrong mainnet prices
+      const norm = normalizeUsernameForRegistry(username);
+      const encoded = norm.ok ? encodeRegisterUsername(norm.name) : null;
+      const regGas = encoded
+        ? await getGasParams(wallet.address as `0x${string}`, {
+            to:   encoded.to,
+            data: encoded.data as `0x${string}`,
+          })
+        : null;
+      if (regGas) console.log(`⛽ Reg gas: limit=${regGas.gasLimit}, maxFee=${regGas.maxFeePerGas}`);
+
+      const regHash = await registerUsernameOnChain(phone, username, wallet.address, regGas ?? undefined);
+      console.log(`⏳ Registration tx broadcast: ${regHash}`);
+      const regReceipt = await client.waitForTransactionReceipt({ hash: regHash as `0x${string}` });
+      if (regReceipt.status === "reverted") {
+        throw new Error("Registration transaction reverted. Your wallet may not have enough MON for gas.");
+      }
       console.log(`✅ @${username} registered on-chain: ${regHash}`);
     } catch (err) {
       console.error(`On-chain registration failed for @${username}:`, err);
@@ -361,17 +475,31 @@ async function handleConfirmation(phone: string, confirmed: boolean): Promise<vo
         }
 
         if (readiness.reason === "insufficient_allowance") {
-          await sendMessage(phone, "🔐 Approving SendrPay to spend your USDC...");
+          await sendMessage(phone, "⏳ One-time setup: allowing SendrPay to send USDC on your behalf...");
           try {
-            const approveCall = encodeErc20Approve(usdcAddress, sendrpayContract.address, required);
+            // Approve MaxUint256 so this never needs to happen again
+            const approveCall = encodeErc20Approve(usdcAddress, sendrpayContract.address, maxUint256);
+
+            // Estimate gas+fees using our RPC so Privy doesn't apply wrong mainnet prices
+            const approveGas = await getGasParams(
+              user.walletAddress as `0x${string}`,
+              { to: approveCall.to, data: approveCall.data as `0x${string}` },
+            );
+            if (approveGas) console.log(`⛽ Approve gas: limit=${approveGas.gasLimit}, maxFee=${approveGas.maxFeePerGas}`);
+
             const approveHash = await signAndBroadcast(phone, {
               to: approveCall.to, data: approveCall.data, value: approveCall.value,
+              ...approveGas,
             });
-            // Wait for approval to be confirmed before sending payment
-            await client.waitForTransactionReceipt({ hash: approveHash as `0x${string}` });
-            console.log(`✅ USDC approved for ${user.username}: ${approveHash}`);
+            console.log(`⏳ Approve tx broadcast: ${approveHash}`);
+
+            const approveReceipt = await client.waitForTransactionReceipt({ hash: approveHash as `0x${string}` });
+            if (approveReceipt.status === "reverted") {
+              throw new Error("Approval transaction reverted on-chain. Ensure your wallet has MON for gas.");
+            }
+            console.log(`✅ USDC unlimited approval confirmed for @${user.username}: ${approveHash}`);
           } catch (err) {
-            await sendMessage(phone, `❌ Approval failed: ${(err as Error).message}\n\nNo funds were moved.`);
+            await sendMessage(phone, `❌ Setup failed: ${(err as Error).message}\n\nNo funds were moved. Please try again.`);
             return;
           }
         }
@@ -381,12 +509,36 @@ async function handleConfirmation(phone: string, confirmed: boolean): Promise<vo
     }
   }
 
+  // ── Estimate gas + fees for pay tx using our Monad RPC ───────────────────────
+  const payPayload = { ...pending.txPayload };
+  if (user) {
+    // Log pre-execution USDC state for debugging
+    try {
+      const payClient = getChainClient();
+      const usdcAddr  = await readUsdcAddress(payClient);
+      const [bal, alw] = await Promise.all([
+        readErc20Balance(payClient, usdcAddr, user.walletAddress as `0x${string}`),
+        readErc20Allowance(payClient, usdcAddr, user.walletAddress as `0x${string}`, sendrpayContract.address),
+      ]);
+      console.log(`💰 Pre-pay state — balance: ${Number(bal)/1e6} USDC, allowance: ${alw === maxUint256 ? "∞" : Number(alw)/1e6 + " USDC"}`);
+    } catch { /* non-fatal */ }
+
+    const payGas = await getGasParams(
+      user.walletAddress as `0x${string}`,
+      { to: payPayload.to as `0x${string}`, data: payPayload.data as `0x${string}`, value: BigInt(payPayload.value) },
+    );
+    if (payGas) {
+      console.log(`⛽ Pay gas: limit=${payGas.gasLimit}, maxFee=${payGas.maxFeePerGas}`);
+      Object.assign(payPayload, payGas);
+    }
+  }
+
   // Execute
   await sendMessage(phone, "⏳ Signing and broadcasting on Monad...");
 
   let txHash: string;
   try {
-    txHash = await signAndBroadcast(phone, pending.txPayload);
+    txHash = await signAndBroadcast(phone, payPayload);
   } catch (err) {
     console.error("Privy signing error:", err);
     await sendMessage(phone, `❌ Transaction failed to broadcast.\n\nError: ${(err as Error).message}\n\nNo funds were moved.`);
@@ -403,15 +555,22 @@ async function handleConfirmation(phone: string, confirmed: boolean): Promise<vo
   });
 
   // Success message
-  const recipientLines = pending.resolved.recipients
-    .map(r => `  • ${r.username} — $${r.amount.toLocaleString()} USDC`)
-    .join("\n");
-
-  const note = pending.resolved.note ? `\n📝 _"${pending.resolved.note}"_` : "";
+  let paymentDetail: string;
+  if (pending.resolved.groupId !== undefined) {
+    const per = pending.resolved.recipients[0]?.amount ?? 0;
+    paymentDetail =
+      `Group: *"${pending.resolved.groupName}"* — ${pending.resolved.recipients.length} members\n` +
+      `$${per.toLocaleString()} USDC each`;
+  } else {
+    const note = pending.resolved.note ? `\n📝 _"${pending.resolved.note}"_` : "";
+    paymentDetail = pending.resolved.recipients
+      .map(r => `  • @${r.username} — $${r.amount.toLocaleString()} USDC`)
+      .join("\n") + note;
+  }
 
   await sendMessage(phone,
     `✅ *Done! Payment sent.*\n\n` +
-    `${recipientLines}${note}\n\n` +
+    `${paymentDetail}\n\n` +
     `💰 Total: *$${pending.resolved.totalAmount.toLocaleString()} USDC*\n` +
     `🔗 Tx: \`${txHash.slice(0, 10)}...${txHash.slice(-6)}\`\n` +
     `🌐 Network: Monad Testnet ⚡\n\n` +
@@ -420,96 +579,117 @@ async function handleConfirmation(phone: string, confirmed: boolean): Promise<vo
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// GROUP MANAGEMENT
+// GROUP MANAGEMENT  (fully on-chain via GroupRegistry)
 // ═════════════════════════════════════════════════════════════════════════════
 async function handleCreateGroup(phone: string, user: User, intent: Intent): Promise<void> {
+  // 1. Resolve all member addresses on-chain
   const invalid: string[] = [];
-  const members: Array<{ username: string; address: string }> = [];
-
+  const members: Array<{ username: string; address: `0x${string}` }> = [];
   for (const raw of intent.members ?? []) {
     try {
       const r = await resolveOne(raw);
       if (r.address.toLowerCase() !== user.walletAddress.toLowerCase()) {
-        members.push({ username: r.username, address: r.address });
+        members.push({ username: r.username, address: r.address as `0x${string}` });
       }
-    } catch {
-      invalid.push(raw);
+    } catch { invalid.push(raw); }
+  }
+  if (invalid.length > 0) {
+    await sendMessage(phone, `❌ These users aren't on SendrPay:\n${invalid.map(u => `@${u}`).join(", ")}\n\nAsk them to sign up first.`);
+    return;
+  }
+  if (members.length === 0) {
+    await sendMessage(phone, "❌ A group needs at least one other person.");
+    return;
+  }
+
+  await sendMessage(phone, `⏳ Creating group *"${intent.name}"* on-chain...`);
+  const client = getChainClient();
+
+  // 2. Submit createGroup tx
+  const createCall = encodeCreateGroup(intent.name!);
+  const createGas  = await getGasParams(user.walletAddress as `0x${string}`, { to: createCall.to, data: createCall.data as `0x${string}` });
+  const createHash = await signAndBroadcast(phone, { to: createCall.to, data: createCall.data, value: createCall.value, ...createGas });
+  const createReceipt = await client.waitForTransactionReceipt({ hash: createHash as `0x${string}` });
+  if (createReceipt.status === "reverted") throw new Error("createGroup transaction reverted.");
+
+  // 3. Read groupId from the GroupCreated event in the confirmed block
+  const createLogs = await client.getLogs({
+    address:   groupRegistryContract.address,
+    event:     { type: "event", name: "GroupCreated", inputs: [{ type: "uint256", name: "groupId", indexed: true }, { type: "address", name: "owner", indexed: true }, { type: "string", name: "name", indexed: false }] } as const,
+    args:      { owner: user.walletAddress as `0x${string}` },
+    fromBlock: createReceipt.blockNumber,
+    toBlock:   createReceipt.blockNumber,
+  });
+  const groupId = (createLogs.at(-1)?.args as { groupId?: bigint }).groupId;
+  if (groupId === undefined) throw new Error("Could not read groupId from event log.");
+  console.log(`✅ Group "${intent.name}" created on-chain, id=${groupId}`);
+
+  // 4. Add each member (sequential — each tx awaited before the next)
+  for (const m of members) {
+    try {
+      const addCall = encodeAddMember(groupId, m.address);
+      const addGas  = await getGasParams(user.walletAddress as `0x${string}`, { to: addCall.to, data: addCall.data as `0x${string}` });
+      const addHash = await signAndBroadcast(phone, { to: addCall.to, data: addCall.data, value: addCall.value, ...addGas });
+      const addReceipt = await client.waitForTransactionReceipt({ hash: addHash as `0x${string}` });
+      if (addReceipt.status === "reverted") console.warn(`addMember(${m.username}) reverted`);
+      else console.log(`✅ Added @${m.username} to group ${groupId}`);
+    } catch (err) {
+      console.warn(`addMember(${m.username}) failed:`, (err as Error).message);
     }
   }
 
-  if (invalid.length > 0) {
-    await sendMessage(phone,
-      `❌ These users aren't on LiquiFi:\n${invalid.join(", ")}\n\nAsk them to message this number to sign up.`
-    );
-    return;
-  }
-
-  if (members.length === 0) {
-    await sendMessage(phone, " A group needs at least one other person.");
-    return;
-  }
-
-  await db.createGroup({ ownerPhone: phone, name: intent.name!, members });
-
-  const memberList = members.map(m => `  • ${m.username}`).join("\n");
+  const memberList = members.map(m => `  • @${m.username}`).join("\n");
   await sendMessage(phone,
-    `✅ Group *"${intent.name}"* created!\n\nMembers:\n${memberList}\n\nNow try:\n• "Send $50 USDC to ${intent.name} group"\n• "Split $100 USDC among ${intent.name} group"`
+    `✅ Group *"${intent.name}"* created!\n\nMembers:\n${memberList}\n\n` +
+    `Now try:\n• "Send $50 USDC to ${intent.name} group"`
   );
 }
 
 async function handleAddToGroup(phone: string, user: User, intent: Intent): Promise<void> {
-  let resolved: { username: string; address: string };
-  try {
-    resolved = await resolveOne(intent.member!);
-  } catch (err) {
-    await sendMessage(phone, ` ${(err as Error).message}`);
-    return;
-  }
+  // Resolve member address on-chain
+  let member: { username: string; address: string };
+  try { member = await resolveOne(intent.member!); }
+  catch (err) { await sendMessage(phone, `❌ ${(err as Error).message}`); return; }
 
-  const group = await db.addGroupMember(phone, intent.groupName!, {
-    username: resolved.username,
-    address:  resolved.address,
-  });
+  // Find groupId for this wallet
+  const client = getChainClient();
+  const result  = await resolveGroupByNameOnChain(client, user.walletAddress as `0x${string}`, intent.groupName!);
+  if (!result.ok) { await sendMessage(phone, `❌ ${result.reason}`); return; }
 
-  if (!group) {
-    await sendMessage(phone, ` Group *"${intent.groupName}"* not found.`);
-    return;
-  }
+  const addCall = encodeAddMember(result.groupId, member.address as `0x${string}`);
+  const addGas  = await getGasParams(user.walletAddress as `0x${string}`, { to: addCall.to, data: addCall.data as `0x${string}` });
+  const addHash = await signAndBroadcast(phone, { to: addCall.to, data: addCall.data, value: addCall.value, ...addGas });
+  const addReceipt = await client.waitForTransactionReceipt({ hash: addHash as `0x${string}` });
+  if (addReceipt.status === "reverted") throw new Error("addMember transaction reverted.");
 
-  await sendMessage(phone,
-    `✅ ${resolved.username} added to *"${intent.groupName}"*.\n\nGroup now has ${group.members.length} member(s).`
-  );
+  // Count current members for display
+  const updatedMembers = await client.readContract({ address: groupRegistryContract.address, abi: groupRegistryContract.abi, functionName: "getMembers", args: [result.groupId] }) as `0x${string}`[];
+  await sendMessage(phone, `✅ @${member.username} added to *"${result.displayName}"*.\n\nGroup now has ${updatedMembers.length} member(s).`);
 }
 
-async function handleRemoveFromGroup(phone: string, _user: User, intent: Intent): Promise<void> {
-  const username = intent.member!.replace("@", "").toLowerCase();
-  const group = await db.removeGroupMember(phone, intent.groupName!, `@${username}`);
+async function handleRemoveFromGroup(phone: string, user: User, intent: Intent): Promise<void> {
+  let member: { username: string; address: string };
+  try { member = await resolveOne(intent.member!); }
+  catch (err) { await sendMessage(phone, `❌ ${(err as Error).message}`); return; }
 
-  if (!group) {
-    await sendMessage(phone, ` Group *"${intent.groupName}"* not found.`);
-    return;
-  }
+  const client = getChainClient();
+  const result  = await resolveGroupByNameOnChain(client, user.walletAddress as `0x${string}`, intent.groupName!);
+  if (!result.ok) { await sendMessage(phone, `❌ ${result.reason}`); return; }
 
-  await sendMessage(phone,
-    `✅ @${username} removed from *"${intent.groupName}"*.\n\nGroup now has ${group.members.length} member(s).`
-  );
+  const rmCall = encodeRemoveMember(result.groupId, member.address as `0x${string}`);
+  const rmGas  = await getGasParams(user.walletAddress as `0x${string}`, { to: rmCall.to, data: rmCall.data as `0x${string}` });
+  const rmHash = await signAndBroadcast(phone, { to: rmCall.to, data: rmCall.data, value: rmCall.value, ...rmGas });
+  const rmReceipt = await client.waitForTransactionReceipt({ hash: rmHash as `0x${string}` });
+  if (rmReceipt.status === "reverted") throw new Error("removeMember transaction reverted.");
+
+  const updatedMembers = await client.readContract({ address: groupRegistryContract.address, abi: groupRegistryContract.abi, functionName: "getMembers", args: [result.groupId] }) as `0x${string}`[];
+  await sendMessage(phone, `✅ @${member.username} removed from *"${result.displayName}"*.\n\nGroup now has ${updatedMembers.length} member(s).`);
 }
 
-async function handleListGroups(phone: string, _user: User): Promise<void> {
-  const groups = await db.getGroupsByOwner(phone);
-
-  if (groups.length === 0) {
-    await sendMessage(phone,
-      `You have no groups yet.\n\nCreate one:\n"Create group Friends with @tolu @ada"`
-    );
-    return;
-  }
-
-  const list = groups.map(g =>
-    `• *${g.name}* — ${g.members.length} member(s): ${g.members.map(m => m.username).join(", ")}`
-  ).join("\n");
-
-  await sendMessage(phone, `📋 *Your Groups*\n\n${list}`);
+async function handleListGroups(phone: string, user: User): Promise<void> {
+  const client = getChainClient();
+  const lines  = await formatGroupsLinesForWallet(client, user.walletAddress as `0x${string}`);
+  await sendMessage(phone, `📋 *Your Groups*\n\n${lines}\n\nTo pay a group:\n• "Send $50 USDC to <group name> group"`);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -557,18 +737,32 @@ async function handleHistory(phone: string, _user: User): Promise<void> {
 // HELPERS
 // ═════════════════════════════════════════════════════════════════════════════
 function buildConfirmText(resolved: ResolvedPayment, _intent: Intent, warning: string | null): string {
-  const recipientLines = resolved.recipients
-    .map(r => `  • ${r.username} — $${r.amount.toLocaleString()} USDC`)
-    .join("\n");
-
   const note    = resolved.note ? `\n📝 "${resolved.note}"` : "";
   const warnStr = warning ? `\n${warning}` : "";
 
+  // Group payment — compact display
+  if (resolved.groupId !== undefined) {
+    const per = resolved.recipients[0]?.amount ?? 0;
+    return (
+      `🎯 *Confirm Group Payment*\n\n` +
+      `Group: *"${resolved.groupName}"*\n` +
+      `Members: *${resolved.recipients.length}*\n` +
+      `Per member: *$${per.toLocaleString()} USDC*\n\n` +
+      `💰 Total: *$${resolved.totalAmount.toLocaleString()} USDC*\n` +
+      `🌐 Network: Monad Testnet${warnStr}\n\n` +
+      `Transactions on Monad are *irreversible*.`
+    );
+  }
+
+  // Single / split payment
+  const recipientLines = resolved.recipients
+    .map(r => `  • @${r.username} — $${r.amount.toLocaleString()} USDC`)
+    .join("\n");
   return (
-    ` *Confirm Payment*\n\n` +
+    `💸 *Confirm Payment*\n\n` +
     `${recipientLines}${note}\n\n` +
-    ` Total: *$${resolved.totalAmount.toLocaleString()} USDC*\n` +
-    ` Network: Monad Testnet${warnStr}\n\n` +
+    `💰 Total: *$${resolved.totalAmount.toLocaleString()} USDC*\n` +
+    `🌐 Network: Monad Testnet${warnStr}\n\n` +
     `Transactions on Monad are *irreversible*.`
   );
 }

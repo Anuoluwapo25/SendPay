@@ -55,7 +55,10 @@ export type Group = {
 export type TxPayload = {
   to: string;
   data: string;
-  value: string; // hex string
+  value: string;               // hex string
+  gasLimit?: bigint;           // explicit gas limit
+  maxFeePerGas?: bigint;       // EIP-1559 max fee per gas (wei)
+  maxPriorityFeePerGas?: bigint; // EIP-1559 priority fee (wei)
 };
 
 export type PrivyWallet = {
@@ -95,6 +98,8 @@ export type ResolvedPayment = {
   recipients: { username: string; address: string; amount: number }[];
   totalAmount: number;
   note?: string;
+  groupId?: bigint;    // set for GROUP_PAYMENT → coordinator uses payGroupEqual
+  groupName?: string;  // display name for confirmation / success messages
 };
 
 // ── Pending tx stored while awaiting WhatsApp confirmation ───────────────────

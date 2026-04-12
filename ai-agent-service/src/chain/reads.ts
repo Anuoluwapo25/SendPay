@@ -10,6 +10,78 @@ const ZERO = "0x0000000000000000000000000000000000000000" as const;
 const ZERO_HASH =
   "0x0000000000000000000000000000000000000000000000000000000000000000" as const;
 
+const NAME_REGISTERED_EVENT = {
+  type:   "event",
+  name:   "NameRegistered",
+  inputs: [
+    { type: "address", name: "owner",    indexed: true  },
+    { type: "bytes32", name: "nameHash", indexed: true  },
+    { type: "string",  name: "name",     indexed: false },
+  ],
+} as const;
+
+/**
+ * Fetch the registered username for a wallet address.
+ *
+ * Strategy (most reliable to least):
+ * 1. `ownerToName` contract read → if zero hash the wallet isn't registered at all.
+ * 2. `NameRegistered` event scan with progressively smaller block windows to work
+ *    around RPC providers that cap eth_getLogs range (e.g. 10 000 blocks).
+ *
+ * Returns null if the address has no registered username OR if the name string
+ * couldn't be retrieved from events (caller should fall back to asking the user).
+ */
+export async function getRegisteredUsernameForAddress(
+  client: PublicClient,
+  wallet: `0x${string}`,
+): Promise<string | null> {
+  // Step 1 — fast contract read: is this wallet registered at all?
+  let nameHash: `0x${string}`;
+  try {
+    nameHash = (await client.readContract({
+      address:      userRegistryContract.address,
+      abi:          userRegistryContract.abi,
+      functionName: "getNameHashByAddress",
+      args:         [wallet],
+    })) as `0x${string}`;
+  } catch (err) {
+    console.warn("getNameHashByAddress failed:", (err as Error).message);
+    return null;
+  }
+  if (nameHash === ZERO_HASH) return null; // definitely not registered
+
+  // Step 2 — wallet IS registered; fetch the name string from event logs.
+  // Try progressively smaller windows to avoid RPC block-range limits.
+  let currentBlock: bigint;
+  try { currentBlock = await client.getBlockNumber(); }
+  catch { currentBlock = 99_999_999n; }
+
+  const windows: bigint[] = [currentBlock, 50_000n, 10_000n, 2_000n];
+  for (const window of windows) {
+    const fromBlock = window >= currentBlock ? 0n : currentBlock - window;
+    try {
+      const logs = await client.getLogs({
+        address:   userRegistryContract.address,
+        event:     NAME_REGISTERED_EVENT,
+        args:      { owner: wallet },
+        fromBlock,
+        toBlock:   "latest",
+      });
+      if (logs.length > 0) {
+        return (logs.at(-1)!.args as { name?: string }).name ?? null;
+      }
+    } catch (err) {
+      console.warn(`getLogs fromBlock=${fromBlock} failed:`, (err as Error).message);
+      // try next (smaller) window
+    }
+  }
+
+  // Contract says registered but we couldn't get the name string from events.
+  // Signal this with a sentinel so the caller can ask the user to confirm their username.
+  console.warn(`Wallet ${wallet} is registered on-chain but name string not retrievable from events.`);
+  return "REGISTERED_UNKNOWN";
+}
+
 export async function isWalletRegisteredOnChain(
   client: PublicClient,
   wallet: `0x${string}`,

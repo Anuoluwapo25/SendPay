@@ -77,11 +77,13 @@ export async function resolveRecipients(
       const per = Math.round((total / result.members.length) * 100) / 100;
       return {
         recipients: result.members.map((addr) => ({
-          username: addr,
+          username: addr,   // address used as display — confirmed on-chain
           address: addr,
           amount: per,
         })),
         totalAmount: total,
+        groupId:   result.groupId,
+        groupName: result.displayName,
       };
     }
 
