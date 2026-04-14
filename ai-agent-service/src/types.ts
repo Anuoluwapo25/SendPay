@@ -1,4 +1,5 @@
 import type { PaymentAction } from "./schemas.js";
+import type { CachedOpportunity, PendingYieldDeposit } from "./lifi/types.js";
 
 // ── WhatsApp / Webhook types ──────────────────────────────────────────────────
 
@@ -80,7 +81,11 @@ export type Intent = {
     | "ADD_TO_GROUP"
     | "REMOVE_FROM_GROUP"
     | "LIST_GROUPS"
-    | "SPLIT_COUNT";
+    | "SPLIT_COUNT"
+    // ── LI.FI Earn intents ────────────────────────────────────────────────
+    | "FIND_YIELD"       // "show me USDC vaults above 5% APY on Arbitrum"
+    | "DEPOSIT_YIELD"    // "put $100 into vault 1" / "deposit $200 into top vault"
+    | "CHECK_POSITIONS"; // "show my yield positions" / "what am I earning"
   totalAmount?: number;
   count?: number;        // SPLIT_COUNT: number of people to split among
   recipient?: string;   // SEND_SINGLE: single recipient username (no @)
@@ -90,6 +95,11 @@ export type Intent = {
   name?: string;        // CREATE_GROUP: the group name
   member?: string;      // ADD_TO_GROUP, REMOVE_FROM_GROUP: single username
   note?: string;
+  // ── Yield-specific fields ─────────────────────────────────────────────
+  minApy?: number;       // FIND_YIELD: minimum APY percentage (e.g. 5 = 5%)
+  yieldChain?: string;   // FIND_YIELD: chain preference (e.g. "Arbitrum")
+  yieldToken?: string;   // FIND_YIELD: token preference (default "USDC")
+  vaultIndex?: number;   // DEPOSIT_YIELD: 1-based index from the displayed list
 };
 
 // ── Resolved payment (addresses looked up) ───────────────────────────────────
@@ -172,8 +182,18 @@ export type ChatResponse =
       type: "info";
       message: string;
       transactions?: EncodedTxJson[];
+    }
+  | {
+      /** Morpho / LI.FI Earn deposit ready to broadcast */
+      type: "earn_draft";
+      preview: string;
+      transactions: EncodedTxJson[];
     };
 
 export type SessionState = {
   pendingDraftId: string | null;
+  /** Vault list shown to user, keyed 1-based for selection */
+  earnOpportunities?: CachedOpportunity[];
+  /** Pending yield deposit awaiting user confirm */
+  pendingYieldDeposit?: PendingYieldDeposit;
 };

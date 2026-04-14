@@ -32,11 +32,18 @@ Group management:
   Remove from group:  {"action":"REMOVE_FROM_GROUP","groupName":"<name>","member":"<username_no_at>"}
   List groups:        {"action":"LIST_GROUPS"}
 
+Yield / Earn (LI.FI):
+  Find vaults:     {"action":"FIND_YIELD","minApy":<number_or_null>,"yieldChain":"<chain_or_null>","yieldToken":"USDC"}
+  Deposit:         {"action":"DEPOSIT_YIELD","totalAmount":<number>,"vaultIndex":<1_based_int_or_null>}
+  My positions:    {"action":"CHECK_POSITIONS"}
+
 Rules:
 - Strip "@" from usernames in the JSON output.
 - Usernames are lowercase letters, numbers, underscores only.
 - All amounts are in USDC (e.g. "$20 USDC", "20 USDC", "20" all mean 20 USDC).
 - "k" suffix means × 1000: "2k" = 2000, "10k" = 10000.
+- For FIND_YIELD: minApy is a percent number (e.g. "above 5%" → 5). yieldChain is the chain name if mentioned ("Arbitrum", "Base", etc.), otherwise null.
+- For DEPOSIT_YIELD: vaultIndex is the vault number the user picked (e.g. "vault 1" → 1, "the top one" → 1, "second one" → 2). null if not specified.
 - If the message is unclear or unrelated, return: {"action":"HELP"}`;
 
 // ── Rule-based fast path ──────────────────────────────────────────────────────
@@ -73,6 +80,58 @@ function ruleParse(text: string): Intent | null {
 
   if (lower === "help" || lower === "help me")
     return { action: "HELP" };
+
+  // ── Yield / Earn intents (LI.FI) ────────────────────────────────────────
+
+  // "my positions" / "my yield" / "what am I earning" / "show my earnings"
+  if (
+    /\bmy\s+(yield|positions?|earnings?|vaults?|deposits?)\b/.test(lower) ||
+    /\bwhat\s+am\s+i\s+earn/i.test(lower) ||
+    /\bshow\s+(my\s+)?(yield|positions?|earnings?)\b/.test(lower)
+  ) {
+    return { action: "CHECK_POSITIONS" };
+  }
+
+  // "find yield" / "show me vaults" / "best APY" / "USDC vaults" / "earn on USDC"
+  const findYield =
+    lower.match(/(?:find|show|get|list)\s+(?:me\s+)?(?:(?:usdc\s+)?yield|(?:usdc\s+)?vaults?|(?:best\s+)?apy)/i) ||
+    lower.match(/\b(?:best|top|highest)\s+(?:apy|yield|rates?|vaults?)\b/i) ||
+    lower.match(/\bearn\s+(?:on\s+)?usdc\b/i) ||
+    lower.match(/\busdc\s+yield\b/i);
+  if (findYield) {
+    // Try to extract "above X%" or "at least X%"
+    const apyMatch = lower.match(/(?:above|over|at\s+least|minimum|min)\s+([\d.]+)\s*%/);
+    const minApy   = apyMatch ? parseFloat(apyMatch[1]!) : undefined;
+    // Try to extract a chain name
+    const chainMatch = lower.match(/\bon\s+(arbitrum|base|ethereum|optimism|polygon|avalanche|bsc|linea|scroll)\b/i);
+    const yieldChain = chainMatch ? chainMatch[1] : undefined;
+    return { action: "FIND_YIELD", minApy, yieldChain, yieldToken: "USDC" };
+  }
+
+  // "deposit $100 into vault 1" / "put $200 in the top vault" / "invest $50 in vault 2"
+  const depositYield = lower.match(
+    /(?:deposit|put|invest|earn\s+with|place)\s+[$]?\s*([\d,.]+k?)\s+(?:usdc\s+)?(?:in(?:to)?|on)\s+(?:vault\s+(\d+)|the\s+(?:top|first|best)|(?:vault\s+)?(\d+))/,
+  );
+  if (depositYield) {
+    const amount = parseMoneyAmount(depositYield[1]!);
+    const idxRaw = depositYield[2] ?? depositYield[3];
+    if (amount) {
+      return {
+        action:     "DEPOSIT_YIELD",
+        totalAmount: amount,
+        vaultIndex:  idxRaw ? parseInt(idxRaw) : 1,
+      };
+    }
+  }
+
+  // "deposit $100" (no vault specified — default to vault 1 if list exists)
+  const depositSimple = lower.match(/(?:deposit|invest)\s+[$]?\s*([\d,.]+k?)\s*(?:usdc)?$/);
+  if (depositSimple) {
+    const amount = parseMoneyAmount(depositSimple[1]!);
+    if (amount) {
+      return { action: "DEPOSIT_YIELD", totalAmount: amount, vaultIndex: 1 };
+    }
+  }
 
   // "create group <name> with @u1 @u2"
   const create = lower.match(/create\s+group\s+['"]?([^'"]+?)['"]?\s+with\s+(.+)/);
@@ -207,7 +266,7 @@ export async function parseIntent(text: string): Promise<Intent> {
     typeof (data as Record<string, unknown>).action !== "string"
   ) {
     throw new Error(
-      'Could not understand that. Try: "Send $20 to @tolu" or type *help*.',
+      'Could not understand that. Try: "Send $20 to @tolu", "Find USDC yield above 5%", or type *help*.',
     );
   }
 

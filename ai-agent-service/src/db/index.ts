@@ -1,10 +1,17 @@
 /**
- * In-memory database for the WhatsApp webhook flow.
+ * Database for the WhatsApp webhook flow.
  *
- * Stores users, sessions, pending transactions, groups, and tx history.
- * All data is lost on restart — swap out the Map stores for a real DB
- * (e.g. Redis, Postgres) when moving to production.
+ * PERSISTENCE STRATEGY
+ * ──────────────────────────────────────────────────────────────────────────────
+ * User records (phone ↔ wallet ↔ username) are written to wallet-state.json
+ * on every create/update so they survive server restarts.
+ *
+ * Ephemeral data (sessions, pending txs, vault cache) stays in-memory only —
+ * these are intentionally short-lived and safe to lose on restart.
  */
+import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, resolve } from "node:path";
 import type {
   User,
   Group,
@@ -13,17 +20,88 @@ import type {
   PendingTxData,
   TxHistoryItem,
 } from "../types.js";
+import type { CachedOpportunity, PendingYieldDeposit } from "../lifi/types.js";
 
-type OnboardingSession = { step: "AWAIT_USERNAME" | string; intent?: Intent; walletAddress?: string; walletId?: string };
+// ── Persistent wallet state file ──────────────────────────────────────────────
+// Resolve relative to this source file so it works regardless of cwd
+const STATE_FILE = resolve(dirname(fileURLToPath(import.meta.url)), "../../wallet-state.json");
+
+type PersistedUser = {
+  walletId:      string;
+  walletAddress: string;
+  username:      string;
+};
+
+type WalletState = {
+  users: Record<string, PersistedUser>; // phone → PersistedUser
+};
+
+function loadState(): WalletState {
+  if (!existsSync(STATE_FILE)) return { users: {} };
+  try {
+    return JSON.parse(readFileSync(STATE_FILE, "utf-8")) as WalletState;
+  } catch {
+    console.warn("[DB] Failed to parse wallet-state.json — starting fresh");
+    return { users: {} };
+  }
+}
+
+function flushState(): void {
+  const state: WalletState = { users: {} };
+  for (const [phone, user] of users.entries()) {
+    state.users[phone] = {
+      walletId:      user.privyWalletId,
+      walletAddress: user.walletAddress,
+      username:      user.username,
+    };
+  }
+  try {
+    writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), "utf-8");
+  } catch (err) {
+    console.error("[DB] Failed to write wallet-state.json:", (err as Error).message);
+  }
+}
 
 // ── In-memory stores ──────────────────────────────────────────────────────────
 const users          = new Map<string, User>();              // phone → User
 const byUsername     = new Map<string, string>();            // username → phone
-const sessions       = new Map<string, OnboardingSession>(); // phone → session
-const pendingTxs     = new Map<string, PendingTxData>();     // phone → pending tx
 const privyWalletIds = new Map<string, string>();            // phone → walletId
-const groupStore     = new Map<string, Group[]>();           // phone → groups
-const txHistoryStore = new Map<string, TxHistoryItem[]>();   // phone → history
+
+// Ephemeral (intentionally lost on restart)
+const sessions       = new Map<string, OnboardingSession>();
+const pendingTxs     = new Map<string, PendingTxData>();
+const groupStore     = new Map<string, Group[]>();
+const txHistoryStore = new Map<string, TxHistoryItem[]>();
+const yieldOppCache  = new Map<string, CachedOpportunity[]>();
+
+// ── Boot: reload users from disk ──────────────────────────────────────────────
+{
+  const state = loadState();
+  let restored = 0;
+  for (const [phone, p] of Object.entries(state.users)) {
+    const user: User = {
+      phone,
+      username:      p.username,
+      walletAddress: p.walletAddress,
+      privyWalletId: p.walletId,
+    };
+    users.set(phone, user);
+    byUsername.set(p.username.toLowerCase(), phone);
+    privyWalletIds.set(phone, p.walletId);
+    restored++;
+  }
+  if (restored > 0) {
+    console.log(`[DB] Restored ${restored} user(s) from wallet-state.json`);
+  }
+}
+
+type OnboardingSession = {
+  step: "AWAIT_USERNAME" | "AWAIT_USERNAME_RECOVERY" | "AWAIT_SPLIT_NAMES" | "AWAIT_YIELD_CONFIRM" | string;
+  intent?: Intent;
+  walletAddress?: string;
+  walletId?: string;
+  yieldDeposit?: PendingYieldDeposit;
+};
 
 export const db = {
   // ── Users ─────────────────────────────────────────────────────────────────
@@ -40,8 +118,21 @@ export const db = {
   async createUser(u: User): Promise<void> {
     users.set(u.phone, u);
     byUsername.set(u.username.toLowerCase(), u.phone);
-    // Also store the privy wallet id in the dedicated map
     privyWalletIds.set(u.phone, u.privyWalletId);
+    flushState();
+  },
+
+  async updateUser(phone: string, updates: Partial<Pick<User, "walletAddress" | "privyWalletId" | "username">>): Promise<void> {
+    const existing = users.get(phone);
+    if (!existing) throw new Error(`No user found for phone ${phone}`);
+    const updated = { ...existing, ...updates };
+    users.set(phone, updated);
+    if (updates.privyWalletId) privyWalletIds.set(phone, updates.privyWalletId);
+    if (updates.username && updates.username !== existing.username) {
+      byUsername.delete(existing.username.toLowerCase());
+      byUsername.set(updates.username.toLowerCase(), phone);
+    }
+    flushState();
   },
 
   async isUsernameTaken(username: string): Promise<boolean> {
@@ -81,9 +172,11 @@ export const db = {
 
   async savePrivyWalletId(phone: string, walletId: string): Promise<void> {
     privyWalletIds.set(phone, walletId);
-    // Keep user record in sync if it exists
     const user = users.get(phone);
-    if (user) users.set(phone, { ...user, privyWalletId: walletId });
+    if (user) {
+      users.set(phone, { ...user, privyWalletId: walletId });
+      flushState(); // persist whenever a wallet ID changes
+    }
   },
 
   // ── Groups ────────────────────────────────────────────────────────────────
@@ -154,6 +247,19 @@ export const db = {
       (m) => m.username.toLowerCase() !== clean,
     );
     return group;
+  },
+
+  // ── LI.FI yield opportunity cache ────────────────────────────────────────
+  async saveYieldOpportunities(phone: string, opps: CachedOpportunity[]): Promise<void> {
+    yieldOppCache.set(phone, opps);
+  },
+
+  async getYieldOpportunities(phone: string): Promise<CachedOpportunity[] | null> {
+    return yieldOppCache.get(phone) ?? null;
+  },
+
+  async clearYieldOpportunities(phone: string): Promise<void> {
+    yieldOppCache.delete(phone);
   },
 
   // ── Transaction history ───────────────────────────────────────────────────

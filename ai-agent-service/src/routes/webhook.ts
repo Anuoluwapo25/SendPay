@@ -17,8 +17,43 @@ import { encodeRegisterUsername }                                             fr
 import { normalizeUsernameForRegistry }                                       from "../chain/normalizeUsername.js";
 import { encodeCreateGroup, encodeAddMember, encodeRemoveMember }            from "../chain/encodeGroupRegistry.js";
 import { sendrpayContract, groupRegistryContract }                           from "../abi/index.js";
-import { maxUint256 }                                                         from "viem";
+import { maxUint256, createPublicClient, http, type Chain }                   from "viem";
 import type { User, Intent, ResolvedPayment, PendingTxData, WebhookBody }    from "../types.js";
+import {
+  getOpportunities,
+  getUserPositions,
+  formatApy,
+  formatTvl,
+  formatOpportunitiesList,
+}                                                                              from "../lifi/earnClient.js";
+import { getDepositQuote, toBaseUnits, estimateDailyEarnings }               from "../lifi/composerClient.js";
+import type { PendingYieldDeposit }                                           from "../lifi/types.js";
+import { signAndBroadcastOnChain }                                            from "../privy/wallet.js";
+
+/** Public RPC endpoints for chains we support yield deposits on */
+const CHAIN_RPCS: Record<number, { rpc: string; name: string; symbol: string; explorer: string }> = {
+  1:      { rpc: "https://eth.llamarpc.com",                      name: "Ethereum",  symbol: "ETH",   explorer: "https://etherscan.io/tx"         },
+  10:     { rpc: "https://mainnet.optimism.io",                   name: "Optimism",  symbol: "ETH",   explorer: "https://optimistic.etherscan.io/tx" },
+  137:    { rpc: "https://polygon-rpc.com",                       name: "Polygon",   symbol: "MATIC", explorer: "https://polygonscan.com/tx"       },
+  8453:   { rpc: "https://mainnet.base.org",                      name: "Base",      symbol: "ETH",   explorer: "https://basescan.org/tx"          },
+  42161:  { rpc: "https://arb1.arbitrum.io/rpc",                  name: "Arbitrum",  symbol: "ETH",   explorer: "https://arbiscan.io/tx"           },
+  43114:  { rpc: "https://api.avax.network/ext/bc/C/rpc",         name: "Avalanche", symbol: "AVAX",  explorer: "https://snowtrace.io/tx"          },
+};
+
+/**
+ * Conservative EIP-1559 gas defaults per chain.
+ * These are used as a guaranteed floor when the live RPC call fails.
+ * All values are WAY below mainnet prices — Privy would otherwise apply
+ * mainnet-level (~30–100 gwei) gas to L2 transactions.
+ */
+const CHAIN_GAS_DEFAULTS: Record<number, { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint }> = {
+  1:      { maxFeePerGas: BigInt(30_000_000_000),  maxPriorityFeePerGas: BigInt(1_000_000_000) }, // Ethereum: 30 gwei
+  10:     { maxFeePerGas: BigInt(1_000_000_000),   maxPriorityFeePerGas: BigInt(1_000_000)     }, // Optimism: 1 gwei
+  137:    { maxFeePerGas: BigInt(50_000_000_000),  maxPriorityFeePerGas: BigInt(30_000_000_000)}, // Polygon: 50 gwei
+  8453:   { maxFeePerGas: BigInt(100_000_000),     maxPriorityFeePerGas: BigInt(1_000_000)     }, // Base: 0.1 gwei
+  42161:  { maxFeePerGas: BigInt(100_000_000),     maxPriorityFeePerGas: BigInt(1_000_000)     }, // Arbitrum: 0.1 gwei
+  43114:  { maxFeePerGas: BigInt(25_000_000_000),  maxPriorityFeePerGas: BigInt(1_000_000_000) }, // Avalanche: 25 gwei
+};
 
 function getChainClient() {
   const rpc = process.env.MONAD_RPC_URL!;
@@ -101,8 +136,8 @@ webhookRouter.post("/", async (req: Request, res: Response) => {
     const lower = text.toLowerCase();
     const pendingTx = await db.getPendingTx(phone);
     if (pendingTx) {
-      const yes = ["yes", "y", "send", "ok", "confirm", "✅"].includes(lower);
-      const no  = ["no",  "n", "cancel", "stop", "❌"].includes(lower);
+      const yes = ["yes", "y", "send", "ok", "confirm", ""].includes(lower);
+      const no  = ["no",  "n", "cancel", "stop", ""].includes(lower);
       if (yes || no) {
         await handleConfirmation(phone, yes);
         return;
@@ -113,7 +148,77 @@ webhookRouter.post("/", async (req: Request, res: Response) => {
     }
 
     // ── Route: check if user exists ───────────────────────────────────────
-    const user = await db.getUserByPhone(phone);
+    let user = await db.getUserByPhone(phone);
+
+    // ── Silent auto-restore: server may have restarted and lost in-memory DB ─
+    // Privy idempotency guarantees the same wallet for the same phone number.
+    if (!user) {
+      try {
+        const wallet   = await createPrivyWallet(phone);
+        const chainCli = getChainClient();
+        const existing = await getRegisteredUsernameForAddress(
+          chainCli,
+          wallet.address as `0x${string}`,
+        );
+        if (existing && existing !== "REGISTERED_UNKNOWN") {
+          // Silently restore — user already registered on-chain
+          await db.createUser({
+            phone,
+            username:      existing,
+            walletAddress: wallet.address,
+            privyWalletId: wallet.id,
+          });
+          user = await db.getUserByPhone(phone);
+          console.log(`♻️  Auto-restored @${existing} for ${phone}`);
+        }
+      } catch (restoreErr) {
+        console.warn("Auto-restore failed (proceeding to onboarding):", (restoreErr as Error).message);
+      }
+    }
+
+    // ── Yield bypass: earn commands work with just a wallet, no Monad username ─
+    // For the LI.FI Earn track the user only needs a wallet address.
+    if (!user) {
+      const lowerMsg = text.toLowerCase();
+      const isYieldCmd =
+        /\b(find|show|get|list)\b.*(yield|vault|apy)/i.test(lowerMsg) ||
+        /\b(best|top|highest)\s+(apy|yield|vault)/i.test(lowerMsg) ||
+        /\bearn\s+(on\s+)?usdc\b/i.test(lowerMsg) ||
+        /\bdeposit\b.*\bvault\b/i.test(lowerMsg) ||
+        /\bput\b.*\bvault\b/i.test(lowerMsg) ||
+        /\bmy\s+(positions?|yield|earnings?)\b/i.test(lowerMsg);
+
+      if (isYieldCmd) {
+        // Do NOT call createPrivyWallet here — it would overwrite privyWalletIds
+        // with a temp entry (no db.createUser) and corrupt the restore path on
+        // next server restart. Instead, look up the wallet from the existing
+        // privyWalletIds entry if present, or create once and store properly.
+        const existingWalletId = await db.getPrivyWalletId(phone);
+        let wallet: import("../types.js").PrivyWallet;
+        if (existingWalletId) {
+          const { getPrivyWallet } = await import("../privy/wallet.js");
+          wallet = await getPrivyWallet(existingWalletId);
+        } else {
+          wallet = await createPrivyWallet(phone);
+          // Persist as a real user so auto-restore works on next restart
+          await db.createUser({
+            phone,
+            username:      `user_${phone.slice(-4)}`,
+            walletAddress: wallet.address,
+            privyWalletId: wallet.id,
+          });
+        }
+        const yieldUser = {
+          phone,
+          username:      `user_${phone.slice(-4)}`,
+          walletAddress: wallet.address,
+          privyWalletId: wallet.id,
+        };
+        await handleCommand(phone, text, yieldUser);
+        return;
+      }
+    }
+
     if (!user) {
       await handleOnboarding(phone, text, msg.name);
       return;
@@ -125,7 +230,7 @@ webhookRouter.post("/", async (req: Request, res: Response) => {
   } catch (err) {
     console.error(`Error handling message from ${phone}:`, err);
     try {
-      await sendMessage(phone, `⚠️ Something went wrong: ${(err as Error).message}\n\nPlease try again or type *help*.`);
+      await sendMessage(phone, ` Something went wrong: ${(err as Error).message}\n\nPlease try again or type *help*.`);
     } catch { /* swallow — don't throw from webhook */ }
   }
 });
@@ -141,10 +246,16 @@ async function handleOnboarding(phone: string, text: string, name: string | null
   // Privy's idempotencyKey guarantees the same wallet address every time.
   const walletForCheck = await createPrivyWallet(phone);
   const client         = getChainClient();
-  const existingUsername = await getRegisteredUsernameForAddress(
-    client,
-    walletForCheck.address as `0x${string}`,
-  );
+  let existingUsername: string | null | "REGISTERED_UNKNOWN" = null;
+  try {
+    existingUsername = await getRegisteredUsernameForAddress(
+      client,
+      walletForCheck.address as `0x${string}`,
+    );
+  } catch (err) {
+    console.warn("getRegisteredUsernameForAddress failed in onboarding:", (err as Error).message);
+    // Fall through — treat as new user
+  }
 
   if (existingUsername === "REGISTERED_UNKNOWN") {
     // Wallet is on-chain registered but event query couldn't retrieve the name.
@@ -161,11 +272,18 @@ async function handleOnboarding(phone: string, text: string, name: string | null
       );
     } else {
       // User is replying with their username for recovery
+      // Guard: if it looks like a command, don't treat it as a username
+      if (text.trim().includes(" ") || text.trim().startsWith("$")) {
+        await sendMessage(phone,
+          `👆 Please reply with just your *@username* to restore your account.\n_(single word, e.g. *@annie*)_`
+        );
+        return;
+      }
       const raw      = text.startsWith("@") ? text.slice(1) : text;
       const username = raw.toLowerCase().replace(/[^a-z0-9]/g, "");
       const check    = await resolveUsernameOnChain(client, username);
       if (!check.ok || check.address.toLowerCase() !== walletForCheck.address.toLowerCase()) {
-        await sendMessage(phone, `❌ *@${username}* doesn't match your wallet. Try again:`);
+        await sendMessage(phone, `*@${username}* doesn't match your wallet. Try again:`);
         return;
       }
       await db.createUser({ phone, username, walletAddress: walletForCheck.address, privyWalletId: walletForCheck.id });
@@ -200,12 +318,11 @@ async function handleOnboarding(phone: string, text: string, name: string | null
   }
   // ─────────────────────────────────────────────────────────────────────────────
 
-  // Step 1 — first contact: show wallet address + faucet, ask for username
+  // Step 1 — first contact: show wallet address + faucets, ask for username
   if (!session) {
     const greeting = name ? `👋 Hey *${name}*!` : "👋 Hey!";
-    await sendMessage(phone, `${greeting} Welcome to *SendrPay* ⚡\n\n⏳ Setting up your Monad wallet...`);
+    await sendMessage(phone, `${greeting} Welcome to *SendPay* ⚡\n\n⏳ Setting up your wallet...`);
 
-    // Save wallet in session so Step 2 can use it without another Privy call
     await db.setSession(phone, {
       step: "AWAIT_USERNAME",
       walletAddress: walletForCheck.address,
@@ -215,17 +332,33 @@ async function handleOnboarding(phone: string, text: string, name: string | null
     await sendMessage(phone,
       `✅ *Your wallet is ready!*\n\n` +
       `💳 Address: \`${walletForCheck.address}\`\n\n` +
-      `⛽ *You need testnet MON for gas fees.*\n` +
-      `Get it free here 👉 https://faucet.monad.xyz\n\n` +
-      `Once you have MON, reply with your desired *@username*:\n` +
-      `_(3–32 chars, letters and numbers only)_\n\n` +
-      `Example: *@tolu*`
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `*You need two things to get started:*\n\n` +
+      `1️⃣ *MON (Monad gas)* — for username registration\n` +
+      `   👉 https://faucet.monad.xyz\n\n` +
+      `2️⃣ *USDC + ETH on Base* — for LI.FI yield deposits\n` +
+      `   👉 https://lifi-faucet.vercel.app\n` +
+      `   _(gives 0.2 USDC + gas on Base)_\n\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `Once you have MON, reply with your *@username*:\n` +
+      `_(single word, 3–32 chars, letters/numbers only)_\n\n` +
+      `Example: *@annie*`
     );
     return;
   }
 
   // Step 2 — user replies with username: validate + register on-chain
   if (session.step === "AWAIT_USERNAME") {
+    // Guard: if the message looks like a command (has spaces or $), don't parse as username
+    if (text.trim().includes(" ") || text.trim().startsWith("$")) {
+      await sendMessage(phone,
+        `👆 Please reply with just your *@username* first.\n` +
+        `_(single word, e.g. *@annie*)_\n\n` +
+        `You can use all commands like *"Find USDC yield"* after you're registered.`
+      );
+      return;
+    }
+
     const raw      = text.startsWith("@") ? text.slice(1) : text;
     const username = raw.toLowerCase().replace(/[^a-z0-9]/g, "");
 
@@ -297,11 +430,16 @@ async function handleOnboarding(phone: string, text: string, name: string | null
     await sendMessage(phone,
       `✅ *@${username}* is yours!\n\n` +
       `💳 Wallet: \`${wallet.address}\`\n\n` +
-      `*Try these commands:*\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `*Earn yield with LI.FI (Base):*\n` +
+      `• "Find USDC yield"\n` +
+      `• "Show me vaults above 3% APY"\n` +
+      `• "Deposit $0.02 in vault 1"\n` +
+      `• "My positions"\n` +
+      `_(Get USDC+gas: https://lifi-faucet.vercel.app)_\n\n` +
+      `*Send money (Monad):*\n` +
       `• "Send $20 USDC to @ada"\n` +
       `• "Split $100 USDC among @tolu @ada @john"\n` +
-      `• "Create group Friends with @tolu @ada"\n` +
-      `• "Send $50 USDC to Friends group"\n` +
       `• "My balance"\n` +
       `━━━━━━━━━━━━━━━━━━━━`
     );
@@ -359,6 +497,21 @@ async function handleCommand(phone: string, text: string, user: User): Promise<v
 
   if (intent.action === "LIST_GROUPS") {
     await handleListGroups(phone, user);
+    return;
+  }
+
+  if (intent.action === "FIND_YIELD") {
+    await handleFindYield(phone, user, intent);
+    return;
+  }
+
+  if (intent.action === "DEPOSIT_YIELD") {
+    await handleDepositYield(phone, user, intent);
+    return;
+  }
+
+  if (intent.action === "CHECK_POSITIONS") {
+    await handleCheckPositions(phone, user);
     return;
   }
 
@@ -430,6 +583,13 @@ async function handleCommand(phone: string, text: string, user: User): Promise<v
 // CONFIRMATION
 // ═════════════════════════════════════════════════════════════════════════════
 async function handleConfirmation(phone: string, confirmed: boolean): Promise<void> {
+  // Check for a pending yield deposit first (stored in session)
+  const session = await db.getSession(phone);
+  if (session?.step === "AWAIT_YIELD_CONFIRM" && session.yieldDeposit) {
+    await handleYieldConfirmation(phone, confirmed, session.yieldDeposit);
+    return;
+  }
+
   const pending = await db.getPendingTx(phone) as PendingTxData | null;
   await db.clearPendingTx(phone);
 
@@ -572,9 +732,8 @@ async function handleConfirmation(phone: string, confirmed: boolean): Promise<vo
     `✅ *Done! Payment sent.*\n\n` +
     `${paymentDetail}\n\n` +
     `💰 Total: *$${pending.resolved.totalAmount.toLocaleString()} USDC*\n` +
-    `🔗 Tx: \`${txHash.slice(0, 10)}...${txHash.slice(-6)}\`\n` +
-    `🌐 Network: Monad Testnet ⚡\n\n` +
-    `View: https://testnet.monadexplorer.com/tx/${txHash}`
+    `🌐 Network: Monad Testnet ⚡\n` +
+    `🔍 https://testnet.monadexplorer.com/tx/${txHash}`
   );
 }
 
@@ -767,6 +926,354 @@ function buildConfirmText(resolved: ResolvedPayment, _intent: Intent, warning: s
   );
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// LI.FI EARN — YIELD HANDLERS
+// ═════════════════════════════════════════════════════════════════════════════
+
+/** FIND_YIELD: fetch top USDC vaults from LI.FI Earn API and list them */
+async function handleFindYield(phone: string, _user: User, intent: Intent): Promise<void> {
+  await sendMessage(phone, "🔍 Searching for the best USDC yield vaults via LI.FI...");
+
+  let opps;
+  try {
+    opps = await getOpportunities({
+      tokenSymbol: intent.yieldToken ?? "USDC",
+      chainName:   intent.yieldChain,
+      minApy:      intent.minApy,
+      limit:       5,
+    });
+  } catch (err) {
+    await sendMessage(phone, `❌ Could not fetch yield data: ${(err as Error).message}`);
+    return;
+  }
+
+  if (opps.length === 0) {
+    const apyNote   = intent.minApy     ? ` above ${intent.minApy}% APY` : "";
+    const chainNote = intent.yieldChain ? ` on ${intent.yieldChain}`     : "";
+    await sendMessage(phone, `😕 No USDC vaults found${apyNote}${chainNote} right now. Try removing filters.`);
+    return;
+  }
+
+  await db.saveYieldOpportunities(phone, opps);
+
+  const list = formatOpportunitiesList(opps);
+  const apyNote   = intent.minApy     ? ` (≥${intent.minApy}% APY)` : "";
+  const chainNote = intent.yieldChain ? ` on ${intent.yieldChain}`   : "";
+
+  await sendMessage(
+    phone,
+    `🏦 *Top USDC Yield Vaults${apyNote}${chainNote}*\n` +
+    `_Powered by LI.FI Earn_\n\n` +
+    `${list}\n\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `To deposit, say:\n` +
+    `• *"Deposit $0.02 in vault 1"* (min with LI.FI faucet)\n` +
+    `• *"Deposit $100 in vault 1"*\n\n` +
+    `_Get USDC+gas: https://lifi-faucet.vercel.app_`,
+  );
+}
+
+/** DEPOSIT_YIELD: get a Composer quote and show confirmation buttons */
+async function handleDepositYield(phone: string, user: User, intent: Intent): Promise<void> {
+  const amount = intent.totalAmount;
+  if (!amount || amount <= 0) {
+    await sendMessage(phone, '❌ Tell me how much to deposit, e.g. *"Deposit $100 in vault 1"*');
+    return;
+  }
+
+  const cached = await db.getYieldOpportunities(phone);
+  if (!cached || cached.length === 0) {
+    await sendMessage(phone, '❓ No vault list yet. First say *"Find USDC yield"* to see options, then pick one.');
+    return;
+  }
+
+  const idx = (intent.vaultIndex ?? 1) - 1;
+  const opp = cached[idx];
+  if (!opp) {
+    await sendMessage(
+      phone,
+      `❌ Vault *${idx + 1}* not in list (you have ${cached.length} vaults). Reply with 1–${cached.length}.`,
+    );
+    return;
+  }
+
+  await sendMessage(phone, `⏳ Getting deposit quote from LI.FI Composer for *${opp.protocol}*...`);
+
+  let quote;
+  try {
+    const fromAmount = toBaseUnits(amount, opp.tokenDecimals);
+    quote = await getDepositQuote({
+      opportunityId:    opp.id,
+      fromChainId:      opp.chainId,
+      fromTokenAddress: opp.tokenAddress,
+      fromAmount,
+      fromAddress:      user.walletAddress,
+      toTokenAddress:   opp.vaultAddress,
+    });
+  } catch (err) {
+    await sendMessage(
+      phone,
+      `❌ Could not get deposit quote: ${(err as Error).message}\n\n` +
+      `Ensure your wallet has *${opp.tokenSymbol}* on *${opp.chainName}* and try again.`,
+    );
+    return;
+  }
+
+  const txReq = quote.transactionRequest;
+  const daily  = estimateDailyEarnings(amount, opp.apy);
+
+  const yieldDeposit: PendingYieldDeposit = {
+    step:        "AWAIT_YIELD_CONFIRM",
+    opportunity: opp,
+    amountHuman: amount,
+    txTo:        txReq.to,
+    txData:      txReq.data,
+    txValue:     txReq.value,
+    txChainId:   txReq.chainId,
+    createdAt:   Date.now(),
+  };
+  await db.setSession(phone, { step: "AWAIT_YIELD_CONFIRM", yieldDeposit });
+
+  const confirmText =
+    `💰 *Confirm Yield Deposit*\n\n` +
+    `Protocol:  *${opp.protocol}*\n` +
+    `Network:   *${opp.chainName}*\n` +
+    `Token:     *${opp.tokenSymbol}*\n` +
+    `Amount:    *$${amount.toLocaleString()} USDC*\n` +
+    `APY:       *${formatApy(opp.apy)}*\n` +
+    `TVL:       ${formatTvl(opp.tvlUsd)}\n` +
+    `Est. daily: ${daily}\n\n` +
+    `_Routed via LI.FI Composer ⚡_\n\n` +
+    `Deposit is *irreversible* once signed.`;
+
+  await sendConfirmButtons(phone, confirmText);
+}
+
+/** CHECK_POSITIONS: show user's active yield positions from LI.FI Earn portfolio */
+async function handleCheckPositions(phone: string, user: User): Promise<void> {
+  await sendMessage(phone, "📊 Fetching your yield positions from LI.FI...");
+
+  let positions;
+  try {
+    positions = await getUserPositions(user.walletAddress);
+  } catch (err) {
+    await sendMessage(phone, `❌ Could not fetch positions: ${(err as Error).message}`);
+    return;
+  }
+
+  const active = positions.filter((p) => p.balanceUsd > 0.01);
+
+  if (active.length === 0) {
+    await sendMessage(
+      phone,
+      `📭 *No active yield positions found.*\n\n` +
+      `Start earning:\n` +
+      `• *"Find USDC yield"*\n` +
+      `• *"Show me vaults above 5% APY on Arbitrum"*`,
+    );
+    return;
+  }
+
+  const total = active.reduce((s, p) => s + p.balanceUsd, 0);
+  const lines = active.map((p, i) => {
+    const proto  = p.protocol  ?? "Unknown";
+    const chain  = p.chainName ?? `Chain ${p.chainId ?? "?"}`;
+    const apyStr = p.apy != null ? ` | ${formatApy(p.apy)} APY` : "";
+    return `${i + 1}. *${proto}* (${chain})\n   Balance: $${p.balanceUsd.toFixed(2)} USDC${apyStr}`;
+  });
+
+  await sendMessage(
+    phone,
+    `📊 *Your Yield Positions*\n` +
+    `_via LI.FI Earn_\n\n` +
+    `${lines.join("\n\n")}\n\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `💰 Total: *$${total.toFixed(2)} USDC*`,
+  );
+}
+
+/** Called when user taps Yes/No while a yield deposit is pending */
+async function handleYieldConfirmation(
+  phone: string,
+  confirmed: boolean,
+  deposit: PendingYieldDeposit,
+): Promise<void> {
+  await db.clearSession(phone);
+
+  if (Date.now() - deposit.createdAt > 120_000) {
+    await sendMessage(phone, "⏰ Deposit expired (2 min). Say *\"Deposit $X in vault N\"* again.");
+    return;
+  }
+
+  if (!confirmed) {
+    await sendMessage(phone, "↩️ Deposit cancelled. No funds moved.");
+    return;
+  }
+
+  // ── Pre-flight: set gas overrides + check ETH balance ────────────────────
+  const user      = await db.getUserByPhone(phone);
+  const chainInfo = CHAIN_RPCS[deposit.txChainId];
+  const txValue   = BigInt(deposit.txValue || "0x0");
+
+  // gasLimit: use LI.FI's quote value (it knows the tx); fall back to 500k
+  const gasLimit = deposit.txGasLimit ? BigInt(deposit.txGasLimit) : BigInt(500_000);
+
+  // ALWAYS initialise with chain-appropriate conservative defaults.
+  // This guarantees Privy never applies mainnet-level gas prices to L2 txs,
+  // even if the live RPC call below fails.
+  const chainDefaults = CHAIN_GAS_DEFAULTS[deposit.txChainId]
+    ?? { maxFeePerGas: BigInt(1_000_000_000), maxPriorityFeePerGas: BigInt(1_000_000) };
+
+  const gasOverrides: { gasLimit: bigint; maxFeePerGas: bigint; maxPriorityFeePerGas: bigint } = {
+    gasLimit,
+    maxFeePerGas:         chainDefaults.maxFeePerGas,
+    maxPriorityFeePerGas: chainDefaults.maxPriorityFeePerGas,
+  };
+
+  // Try to refine gas price + check balance using live on-chain data
+  if (chainInfo) {
+    try {
+      const viemChain: Chain = {
+        id: deposit.txChainId,
+        name: chainInfo.name,
+        nativeCurrency: { name: chainInfo.symbol, symbol: chainInfo.symbol, decimals: 18 },
+        rpcUrls: { default: { http: [chainInfo.rpc] } },
+      };
+      const rpcClient = createPublicClient({ chain: viemChain, transport: http(chainInfo.rpc) });
+
+      const [nativeBalance, fees] = await Promise.all([
+        user ? rpcClient.getBalance({ address: user.walletAddress as `0x${string}` }) : Promise.resolve(undefined),
+        rpcClient.estimateFeesPerGas(),
+      ]);
+
+      // Refine with live values (only override if RPC returned real data)
+      if (fees.maxFeePerGas) {
+        gasOverrides.maxFeePerGas         = fees.maxFeePerGas;
+        gasOverrides.maxPriorityFeePerGas = fees.maxPriorityFeePerGas ?? chainDefaults.maxPriorityFeePerGas;
+      }
+
+      console.log(
+        `[Yield gas] chain=${deposit.txChainId} gasLimit=${gasLimit} ` +
+        `maxFeePerGas=${gasOverrides.maxFeePerGas} txValue=${txValue} ` +
+        `estCost=${(Number(gasLimit * gasOverrides.maxFeePerGas + txValue) / 1e18).toFixed(8)} ETH`,
+      );
+
+      if (nativeBalance !== undefined) {
+        const totalRequired = gasLimit * gasOverrides.maxFeePerGas + txValue;
+        if (nativeBalance < totalRequired) {
+          const have = (Number(nativeBalance) / 1e18).toFixed(6);
+          const need = (Number(totalRequired) / 1e18).toFixed(6);
+          await sendMessage(
+            phone,
+            `⚠️ *Not enough ${chainInfo.symbol} for gas*\n\n` +
+            `Your wallet has *${have} ${chainInfo.symbol}* on ${chainInfo.name} ` +
+            `but this transaction needs ~*${need} ${chainInfo.symbol}* to cover gas fees.\n\n` +
+            `Top up ${chainInfo.symbol} on ${chainInfo.name} and try again — even $3–5 covers most deposits.\n\n` +
+            `Your wallet: \`${user!.walletAddress}\``,
+          );
+          return;
+        }
+      }
+    } catch (rpcErr) {
+      // RPC failed — gasOverrides already set to chain defaults above, which is
+      // far cheaper than Privy's mainnet estimate. Proceed with those.
+      console.warn(`[Yield gas] RPC check failed, using chain defaults:`, (rpcErr as Error).message);
+    }
+  }
+
+  // ── USDC approval pre-flight ─────────────────────────────────────────────────
+  // LI.FI Diamond needs allowance to pull USDC from the wallet.
+  // Check on-chain and send an approve tx if needed before the deposit.
+  if (user && chainInfo) {
+    try {
+      const viemChainForApproval: Chain = {
+        id: deposit.txChainId,
+        name: chainInfo.name,
+        nativeCurrency: { name: chainInfo.symbol, symbol: chainInfo.symbol, decimals: 18 },
+        rpcUrls: { default: { http: [chainInfo.rpc] } },
+      };
+      const rpcClientForApproval = createPublicClient({
+        chain: viemChainForApproval,
+        transport: http(chainInfo.rpc),
+      });
+
+      const tokenAddress  = deposit.opportunity.tokenAddress as `0x${string}`;
+      const spender       = deposit.txTo as `0x${string}`;
+      const amountNeeded  = BigInt(
+        Math.round(deposit.amountHuman * 10 ** deposit.opportunity.tokenDecimals),
+      );
+
+      const allowance = await readErc20Allowance(
+        rpcClientForApproval,
+        tokenAddress,
+        user.walletAddress as `0x${string}`,
+        spender,
+      );
+
+      if (allowance < amountNeeded) {
+        await sendMessage(phone, `🔑 Approving ${deposit.opportunity.tokenSymbol} for LI.FI...`);
+
+        // Approve maxUint256 so future deposits don't need another approval
+        const approveData = encodeErc20Approve(tokenAddress, spender, maxUint256);
+        await signAndBroadcastOnChain(
+          phone,
+          {
+            to:   approveData.to,
+            data: approveData.data,
+            value: "0x0",
+            ...gasOverrides,
+            gasLimit: BigInt(100_000), // approval is cheap — no need for 500k
+          },
+          deposit.txChainId,
+        );
+        console.log(`[Yield approve] Approved ${deposit.opportunity.tokenSymbol} for ${spender}`);
+      }
+    } catch (approveErr) {
+      console.warn("[Yield approve] Allowance check/approve failed:", (approveErr as Error).message);
+      // Not fatal — proceed and let the deposit tx fail with a clear error if needed
+    }
+  }
+
+  await sendMessage(phone, `⏳ Signing yield deposit on *${deposit.opportunity.chainName}* via LI.FI...`);
+
+  let txHash: string;
+  try {
+    txHash = await signAndBroadcastOnChain(
+      phone,
+      { to: deposit.txTo, data: deposit.txData, value: deposit.txValue, ...gasOverrides },
+      deposit.txChainId,
+    );
+  } catch (err) {
+    const errMsg = (err as Error).message ?? "";
+    const isGasError = /insufficient funds|gas.*price.*value|balance.*too low/i.test(errMsg);
+    await sendMessage(
+      phone,
+      `❌ Deposit failed: ${errMsg}\n\n` +
+      (isGasError
+        ? `Your wallet needs more *${chainInfo?.symbol ?? "ETH"}* on *${deposit.opportunity.chainName}* for gas fees.\n` +
+          `Top up your native token (ETH on Base/Arbitrum/Optimism, MATIC on Polygon) and retry.`
+        : `Check that your wallet has *${deposit.opportunity.tokenSymbol}* and enough native token for gas on *${deposit.opportunity.chainName}*.`),
+    );
+    return;
+  }
+
+  await db.clearYieldOpportunities(phone);
+
+  await sendMessage(
+    phone,
+    `✅ *Yield Deposit Sent!*\n\n` +
+    `Protocol:  *${deposit.opportunity.protocol}*\n` +
+    `Network:   *${deposit.opportunity.chainName}*\n` +
+    `Amount:    *$${deposit.amountHuman.toLocaleString()} ${deposit.opportunity.tokenSymbol}*\n` +
+    `APY:       *${formatApy(deposit.opportunity.apy)}*\n` +
+    `Est. daily: ${estimateDailyEarnings(deposit.amountHuman, deposit.opportunity.apy)}\n\n` +
+    `🔗 Tx: \`${txHash}\`\n` +
+    `🔍 ${chainInfo?.explorer ?? "https://basescan.org/tx"}/${txHash}\n\n` +
+    `Say *"My positions"* in 2–3 min to check your earnings\n` +
+    `_(LI.FI takes a moment to index new deposits)_`,
+  );
+}
+
 async function sendHelp(phone: string, user: User): Promise<void> {
   await sendMessage(phone,
     `🤖 *Sendpay — Command Guide*\n\n` +
@@ -781,6 +1288,11 @@ async function sendHelp(phone: string, user: User): Promise<void> {
     `• "Send $50 USDC to Friends group"\n` +
     `• "Add @john to Friends group"\n` +
     `• "My groups"\n\n` +
+    `*Yield / Earn (LI.FI):*\n` +
+    `• "Find USDC yield"\n` +
+    `• "Show me vaults above 5% APY on Arbitrum"\n` +
+    `• "Deposit $100 in vault 1"\n` +
+    `• "My positions"\n\n` +
     `*Account:*\n` +
     `• "My balance"\n` +
     `• "My transactions"\n` +

@@ -24,6 +24,14 @@ export const adminActionSchema = z.enum([
 
 export type AdminAction = z.infer<typeof adminActionSchema>;
 
+export const earnActionSchema = z.enum([
+  "LIST_OPPORTUNITIES", // "show me yield vaults" / "earn yield on my USDC"
+  "DEPOSIT_YIELD",      // "deposit 0.1 USDC into vault 1" / "put $50 into Morpho"
+  "VIEW_POSITIONS",     // "show my yield positions" / "what am I earning"
+]);
+
+export type EarnAction = z.infer<typeof earnActionSchema>;
+
 export const parsedIntentSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("payment"),
@@ -47,6 +55,18 @@ export const parsedIntentSchema = z.discriminatedUnion("kind", [
     /** ADD_MEMBERS / REMOVE_MEMBERS / CANCEL_GROUP */
     groupId: z.union([z.string(), z.number()]).optional(),
     members: z.array(z.string()).optional(),
+  }),
+  z.object({
+    kind: z.literal("earn"),
+    action: earnActionSchema,
+    /** DEPOSIT_YIELD: human USDC amount to deposit (e.g. 0.1) */
+    amount: z.number().positive().optional(),
+    /** DEPOSIT_YIELD: 1-based index from the displayed vault list */
+    vaultIndex: z.number().int().positive().optional(),
+    /** LIST_OPPORTUNITIES: minimum APY filter (e.g. 3 = ≥ 3%) */
+    minApy: z.number().optional(),
+    /** LIST_OPPORTUNITIES: chain name filter (e.g. "Base") */
+    chainName: z.string().optional(),
   }),
   z.object({
     kind: z.literal("unknown"),

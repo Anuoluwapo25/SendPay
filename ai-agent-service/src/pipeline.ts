@@ -23,9 +23,21 @@ import {
   getPendingDraft,
   saveDraft,
   setPendingDraft,
+  setEarnOpportunities,
+  getEarnOpportunity,
+  setPendingYieldDeposit,
+  getPendingYieldDeposit,
 } from "./state.js";
 import type { ChatResponse, EncodedTxJson } from "./types.js";
 import type { ResolutionDeps } from "./deps/types.js";
+import {
+  getOpportunities,
+  getUserPositions,
+  formatOpportunitiesList,
+  formatApy,
+} from "./lifi/earnClient.js";
+import { getDepositQuote, toBaseUnits, estimateDailyEarnings } from "./lifi/composerClient.js";
+import type { PendingYieldDeposit } from "./lifi/types.js";
 
 function parseGroupId(
   raw: string | number | undefined | null,
@@ -701,6 +713,189 @@ export async function adminFromIntent(
   return { kind: "clarify", question: "Unknown admin command." };
 }
 
+// ── LI.FI Earn handler ───────────────────────────────────────────────────────────────
+
+export async function earnFromIntent(
+  intent: ParsedIntent,
+  sessionId: string,
+  walletAddress: `0x${string}` | undefined,
+): Promise<ChatResponse> {
+  if (intent.kind !== "earn") {
+    return { type: "clarify", question: "Not an earn command." };
+  }
+
+  // ── LIST_OPPORTUNITIES ────────────────────────────────────────────────────
+  if (intent.action === "LIST_OPPORTUNITIES") {
+    let opps;
+    try {
+      opps = await getOpportunities({
+        tokenSymbol: "USDC",
+        chainName: intent.chainName,
+        minApy: intent.minApy,
+        limit: 5,
+      });
+    } catch (e) {
+      return {
+        type: "info",
+        message: `⚠️ Could not fetch yield vaults right now: ${
+          e instanceof Error ? e.message : String(e)
+        }. Try again in a moment.`,
+      };
+    }
+    setEarnOpportunities(sessionId, opps);
+    const list = formatOpportunitiesList(opps);
+    return {
+      type: "info",
+      message:
+        `*🏦 Top USDC Yield Vaults (via LI.FI)*\n\n${list}\n\n` +
+        `Reply with a number and amount to deposit, e.g.\n` +
+        `*deposit 0.1 USDC into vault 1* or *1 with 0.05 USDC*`,
+    };
+  }
+
+  // ── DEPOSIT_YIELD ───────────────────────────────────────────────────────────
+  if (intent.action === "DEPOSIT_YIELD") {
+    if (!walletAddress) {
+      return {
+        type: "clarify",
+        question: "Pass **walletAddress** so we can build your deposit transaction.",
+      };
+    }
+    const amount = intent.amount;
+    if (!amount || amount <= 0) {
+      return {
+        type: "clarify",
+        question: "How much USDC would you like to deposit? e.g. *deposit 0.1 USDC into vault 1*",
+      };
+    }
+    if (amount < 0.02) {
+      return {
+        type: "clarify",
+        question: `Minimum deposit is **0.02 USDC** (balances visible from 0.02 USDC on Morpho). You entered ${amount} USDC.`,
+      };
+    }
+
+    // Get the selected vault (or default to vault 1 = Morpho)
+    const opp = getEarnOpportunity(sessionId, intent.vaultIndex ?? 1);
+    if (!opp) {
+      // No opportunities list in session — fetch first
+      try {
+        const opps = await getOpportunities({ tokenSymbol: "USDC", limit: 5 });
+        setEarnOpportunities(sessionId, opps);
+      } catch {
+        return {
+          type: "clarify",
+          question: "Say *earn yield on my USDC* first to see the vault list, then pick one.",
+        };
+      }
+    }
+    const vault = getEarnOpportunity(sessionId, intent.vaultIndex ?? 1);
+    if (!vault) {
+      return {
+        type: "clarify",
+        question: "Could not find that vault. Say *earn yield* to see the current list.",
+      };
+    }
+
+    // Build deposit tx via LI.FI Composer
+    let quote;
+    try {
+      quote = await getDepositQuote({
+        opportunityId: vault.id,
+        fromChainId: vault.chainId,
+        fromTokenAddress: vault.tokenAddress,
+        fromAmount: toBaseUnits(amount, vault.tokenDecimals),
+        fromAddress:walletAddress,
+        toTokenAddress: vault.vaultAddress,
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return {
+        type: "clarify",
+        question: `Could not build deposit quote: ${msg.slice(0, 200)}. Check that you have enough USDC on Base and try again.`,
+      };
+    }
+
+    const tx = quote.transactionRequest;
+    const daily = estimateDailyEarnings(amount, vault.apy);
+    const yearly = estimateDailyEarnings(amount * 365, vault.apy);
+
+    // Store pending for confirm
+    const deposit: PendingYieldDeposit = {
+      step: "AWAIT_YIELD_CONFIRM",
+      opportunity: vault,
+      amountHuman: amount,
+      txTo:       tx.to,
+      txData:     tx.data,
+      txValue:    tx.value,
+      txChainId:  tx.chainId,
+      txGasLimit: tx.gasLimit,
+      txGasPrice: tx.gasPrice,
+      createdAt:  Date.now(),
+    };
+    setPendingYieldDeposit(sessionId, deposit);
+
+    return {
+      type: "info",
+      message:
+        `*🏦 Yield Deposit Preview*\n\n` +
+        `• Vault: *${vault.protocol} Gauntlet USDC Prime*\n` +
+        `• Network: *${vault.chainName}* (Chain ID: ${vault.chainId})\n` +
+        `• Amount: *${amount} USDC*\n` +
+        `• APY: *${formatApy(vault.apy)}*\n` +
+        `• Daily earnings: *${daily}*\n` +
+        `• Yearly earnings: *${yearly.replace("~$", "~$")}*\n\n` +
+        `Type *confirm* to sign and broadcast, or *cancel* to abort.`,
+    };
+  }
+
+  // ── VIEW_POSITIONS ───────────────────────────────────────────────────────────
+  if (intent.action === "VIEW_POSITIONS") {
+    if (!walletAddress) {
+      return {
+        type: "clarify",
+        question: "Pass **walletAddress** so I can check your yield positions.",
+      };
+    }
+    let positions;
+    try {
+      positions = await getUserPositions(walletAddress);
+    } catch (e) {
+      return {
+        type: "info",
+        message: `⚠️ Could not fetch positions: ${e instanceof Error ? e.message : String(e)}`,
+      };
+    }
+    if (positions.length === 0) {
+      return {
+        type: "info",
+        message:
+          `No active yield positions found for ${walletAddress.slice(0, 6)}…${walletAddress.slice(-4)}.\n` +
+          `Say *earn yield on my USDC* to see available vaults and make a deposit.`,
+      };
+    }
+    const NUMS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"];
+    const lines = positions.map((p, i) => {
+      const num = NUMS[i] ?? `${i + 1}.`;
+      return (
+        `${num} *${p.protocol ?? "Unknown"}* on ${p.chainName ?? "??"}\n` +
+        `   Balance: *$${p.balanceUsd.toFixed(4)} USDC*` +
+        (p.apy ? ` | APY: *${formatApy(p.apy)}*` : "")
+      );
+    });
+    const total = positions.reduce((s, p) => s + (p.balanceUsd ?? 0), 0);
+    return {
+      type: "info",
+      message:
+        `*📈 Your Yield Positions*\n\n${lines.join("\n\n")}\n\n` +
+        `Total: *$${total.toFixed(4)} USDC*\n` +
+        `View on Morpho: https://app.morpho.org/base/vault/0x050cE30b927Da55177A4914EC73480238BAD56f0/gauntlet-usdc-prime`,
+    };
+  }
+
+  return { type: "clarify", question: "Unknown earn command." };
+}
+
 const CONFIRM_RE = /^(yes|y|confirm|ok|proceed|sure)\b/i;
 const CANCEL_RE = /^(no|cancel|stop|nope)\b/i;
 
@@ -716,6 +911,27 @@ export async function handleUserMessage(
   const t = message.trim();
 
   if (CONFIRM_RE.test(t)) {
+    // ── Check yield deposit confirmation first ────────────────────────────
+    const pendingYield = getPendingYieldDeposit(sessionId);
+    if (pendingYield) {
+      setPendingYieldDeposit(sessionId, null);
+      const earnTx: EncodedTxJson = {
+        to: pendingYield.txTo,
+        data: pendingYield.txData,
+        value: pendingYield.txValue,
+        description: `Deposit ${pendingYield.amountHuman} USDC into ${pendingYield.opportunity.protocol} on ${pendingYield.opportunity.chainName}`,
+      };
+      return {
+        type: "earn_draft",
+        preview:
+          `Deposit ${pendingYield.amountHuman} USDC into ` +
+          `${pendingYield.opportunity.protocol} (${pendingYield.opportunity.chainName}) ` +
+          `at ${formatApy(pendingYield.opportunity.apy)} APY`,
+        transactions: [earnTx],
+      };
+    }
+
+    // ── Existing payment draft confirmation ─────────────────────────────
     const pending = getPendingDraft(sessionId);
     if (!pending) {
       return {
@@ -766,6 +982,12 @@ export async function handleUserMessage(
   }
 
   if (CANCEL_RE.test(t)) {
+    // Clear yield deposit if pending
+    const pendingYield = getPendingYieldDeposit(sessionId);
+    if (pendingYield) {
+      setPendingYieldDeposit(sessionId, null);
+      return { type: "cancelled", message: "Yield deposit cancelled. What next?" };
+    }
     const pending = getPendingDraft(sessionId);
     if (pending) {
       clearDraft(pending.draftId);
@@ -787,7 +1009,7 @@ export async function handleUserMessage(
     return {
       type: "clarify",
       question:
-        "I did not understand. Try **register as yourname**, **send $20 to @alice**, or **I want to send $100 to group Friends** — or say **help**.",
+        "I did not understand. Try **register as yourname**, **send $20 to @alice**, **earn yield on my USDC**, or say **help**.",
     };
   }
 
@@ -801,6 +1023,11 @@ export async function handleUserMessage(
       message: a.message,
       ...(a.transactions?.length ? { transactions: a.transactions } : {}),
     };
+  }
+
+  // ── LI.FI Earn intents ─────────────────────────────────────────────────────
+  if (intent.kind === "earn") {
+    return earnFromIntent(intent, sessionId, walletAddress);
   }
 
   if (intent.kind === "payment") {

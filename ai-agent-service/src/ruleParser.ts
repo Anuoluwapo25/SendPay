@@ -47,6 +47,54 @@ export function ruleParse(message: string): ParsedIntent | null {
     return { kind: "admin", action: "LIST_GROUPS" };
   }
 
+  // ── LI.FI Earn rules ──────────────────────────────────────────────────────
+
+  // VIEW_POSITIONS: "show my yield positions", "what am I earning", "my positions"
+  if (
+    /\b(my|show)\b.*\b(position|earning|yield|deposit)\b/i.test(lower) ||
+    /\b(what|how much)\b.*(earn|yield|position|morpho)\b/i.test(lower) ||
+    /^(my\s+)?positions?\s*$/i.test(lower)
+  ) {
+    return { kind: "earn", action: "VIEW_POSITIONS" };
+  }
+
+  // DEPOSIT_YIELD: "deposit 0.1 usdc into vault 1", "put $50 into morpho", "deposit 0.1 into 1"
+  const depositVault = lower.match(
+    /(?:deposit|put|invest)\s+\$?\s*([\d.]+)\s*(?:usdc|usd|dollars?)?\s+(?:into|in|to)\s+(?:vault\s+)?(\d+|morpho|top)/i,
+  );
+  if (depositVault) {
+    const amount = parseMoneyAmount(depositVault[1]!);
+    const raw2 = depositVault[2]!.trim().toLowerCase();
+    const vaultIndex = raw2 === "morpho" || raw2 === "top" ? 1 : parseInt(raw2, 10);
+    if (amount != null) {
+      return {
+        kind: "earn",
+        action: "DEPOSIT_YIELD",
+        amount,
+        vaultIndex: Number.isFinite(vaultIndex) ? vaultIndex : 1,
+      };
+    }
+  }
+
+  // DEPOSIT_YIELD (no vault specified): "deposit 0.1 usdc", "earn with 0.05 usdc"
+  const depositSimple = lower.match(
+    /^(?:deposit|invest|earn\s+with)\s+\$?\s*([\d.]+)\s*(?:usdc|usd|dollars?)?\s*\.?$/i,
+  );
+  if (depositSimple) {
+    const amount = parseMoneyAmount(depositSimple[1]!);
+    if (amount != null) {
+      return { kind: "earn", action: "DEPOSIT_YIELD", amount, vaultIndex: 1 };
+    }
+  }
+
+  // LIST_OPPORTUNITIES: "earn yield", "show vaults", "morpho", "best apy", "yield options"
+  if (
+    /\b(earn|yield|vault|invest|apy|morpho|usdc.*vault|best.*rate)\b/i.test(lower) &&
+    !/\b(send|pay|split|register|approve|group)\b/i.test(lower)
+  ) {
+    return { kind: "earn", action: "LIST_OPPORTUNITIES" };
+  }
+
   if (lower.includes("help") && lower.split(/\s+/).length <= 3) {
     return { kind: "admin", action: "HELP" };
   }

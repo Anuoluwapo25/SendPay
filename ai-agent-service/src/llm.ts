@@ -16,9 +16,13 @@ const SYSTEM = `You are SendR's intent parser. Output ONLY valid JSON matching t
 - Create group: {"kind":"admin","action":"CREATE_GROUP","groupName":"string","members":["u1","u2"]}
 - List groups: {"kind":"admin","action":"LIST_GROUPS"}
 - Help: {"kind":"admin","action":"HELP"}
+- Show USDC yield vaults / earn / invest / Morpho / APY: {"kind":"earn","action":"LIST_OPPORTUNITIES"}
+- Deposit USDC into a vault (pick by number): {"kind":"earn","action":"DEPOSIT_YIELD","amount":number,"vaultIndex":number}
+- Deposit USDC (no vault specified, default vault 1): {"kind":"earn","action":"DEPOSIT_YIELD","amount":number,"vaultIndex":1}
+- Show yield positions / what am I earning / my Morpho balance: {"kind":"earn","action":"VIEW_POSITIONS"}
 - If unclear: {"kind":"unknown","rawSummary":"short reason"}
 
-Rules: amounts are USDC (user may say dollars or $ — use the number). Usernames: a–z 0–9 only, 3–32 chars, no @ in JSON.`;
+Rules: amounts are USDC (user may say dollars or $ — use the number). Usernames: a–z 0–9 only, 3–32 chars, no @ in JSON. For earn intents, vaultIndex is 1-based integer matching the vault list shown to the user.`;
 
 /** Groq exposes an OpenAI-compatible Chat Completions API. */
 export function createGroqClient(): OpenAI | null {
