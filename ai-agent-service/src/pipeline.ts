@@ -825,13 +825,15 @@ export async function earnFromIntent(
       step: "AWAIT_YIELD_CONFIRM",
       opportunity: vault,
       amountHuman: amount,
-      txTo:       tx.to,
-      txData:     tx.data,
-      txValue:    tx.value,
-      txChainId:  tx.chainId,
-      txGasLimit: tx.gasLimit,
-      txGasPrice: tx.gasPrice,
-      createdAt:  Date.now(),
+      txTo:            tx.to,
+      txData:          tx.data,
+      txValue:         tx.value,
+      txChainId:       tx.chainId,
+      txGasLimit:      tx.gasLimit,
+      txGasPrice:      tx.gasPrice,
+      // LI.FI tells us exactly which address needs the ERC-20 allowance
+      approvalAddress: quote.estimate.approvalAddress,
+      createdAt:       Date.now(),
     };
     setPendingYieldDeposit(sessionId, deposit);
 

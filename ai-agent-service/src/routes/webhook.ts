@@ -1023,14 +1023,18 @@ async function handleDepositYield(phone: string, user: User, intent: Intent): Pr
   const daily  = estimateDailyEarnings(amount, opp.apy);
 
   const yieldDeposit: PendingYieldDeposit = {
-    step:        "AWAIT_YIELD_CONFIRM",
-    opportunity: opp,
-    amountHuman: amount,
-    txTo:        txReq.to,
-    txData:      txReq.data,
-    txValue:     txReq.value,
-    txChainId:   txReq.chainId,
-    createdAt:   Date.now(),
+    step:            "AWAIT_YIELD_CONFIRM",
+    opportunity:     opp,
+    amountHuman:     amount,
+    txTo:            txReq.to,
+    txData:          txReq.data,
+    txValue:         txReq.value,
+    txChainId:       txReq.chainId,
+    txGasLimit:      txReq.gasLimit,
+    txGasPrice:      txReq.gasPrice,
+    // Exact spender address LI.FI requires for the ERC-20 allowance
+    approvalAddress: quote.estimate.approvalAddress,
+    createdAt:       Date.now(),
   };
   await db.setSession(phone, { step: "AWAIT_YIELD_CONFIRM", yieldDeposit });
 
@@ -1182,9 +1186,10 @@ async function handleYieldConfirmation(
   }
 
   // ── USDC approval pre-flight ─────────────────────────────────────────────────
-  // LI.FI Diamond needs allowance to pull USDC from the wallet.
-  // Check on-chain and send an approve tx if needed before the deposit.
-  if (user && chainInfo) {
+  // LI.FI tells us the exact spender via quote.estimate.approvalAddress.
+  // We must approve that address before sending the deposit transaction.
+  // (For native token deposits approvalAddress is undefined — skip in that case.)
+  if (user && chainInfo && deposit.approvalAddress) {
     try {
       const viemChainForApproval: Chain = {
         id: deposit.txChainId,
@@ -1198,7 +1203,7 @@ async function handleYieldConfirmation(
       });
 
       const tokenAddress  = deposit.opportunity.tokenAddress as `0x${string}`;
-      const spender       = deposit.txTo as `0x${string}`;
+      const spender       = deposit.approvalAddress as `0x${string}`;
       const amountNeeded  = BigInt(
         Math.round(deposit.amountHuman * 10 ** deposit.opportunity.tokenDecimals),
       );
@@ -1210,6 +1215,8 @@ async function handleYieldConfirmation(
         spender,
       );
 
+      console.log(`[Yield approve] allowance=${allowance} needed=${amountNeeded} spender=${spender}`);
+
       if (allowance < amountNeeded) {
         await sendMessage(phone, `🔑 Approving ${deposit.opportunity.tokenSymbol} for LI.FI...`);
 
@@ -1218,19 +1225,21 @@ async function handleYieldConfirmation(
         await signAndBroadcastOnChain(
           phone,
           {
-            to:   approveData.to,
-            data: approveData.data,
+            to:    approveData.to,
+            data:  approveData.data,
             value: "0x0",
             ...gasOverrides,
-            gasLimit: BigInt(100_000), // approval is cheap — no need for 500k
+            gasLimit: BigInt(100_000), // approval is cheap
           },
           deposit.txChainId,
         );
-        console.log(`[Yield approve] Approved ${deposit.opportunity.tokenSymbol} for ${spender}`);
+        console.log(`[Yield approve] ✅ Approved ${deposit.opportunity.tokenSymbol} for ${spender}`);
+      } else {
+        console.log(`[Yield approve] Allowance already sufficient — skipping approve`);
       }
     } catch (approveErr) {
       console.warn("[Yield approve] Allowance check/approve failed:", (approveErr as Error).message);
-      // Not fatal — proceed and let the deposit tx fail with a clear error if needed
+      // Not fatal — attempt the deposit anyway; it will fail with a clear error if allowance is still insufficient
     }
   }
 
@@ -1267,8 +1276,7 @@ async function handleYieldConfirmation(
     `Amount:    *$${deposit.amountHuman.toLocaleString()} ${deposit.opportunity.tokenSymbol}*\n` +
     `APY:       *${formatApy(deposit.opportunity.apy)}*\n` +
     `Est. daily: ${estimateDailyEarnings(deposit.amountHuman, deposit.opportunity.apy)}\n\n` +
-    `🔗 Tx: \`${txHash}\`\n` +
-    `🔍 ${chainInfo?.explorer ?? "https://basescan.org/tx"}/${txHash}\n\n` +
+    `🔍 https://scan.li.fi/tx/${txHash}\n\n` +
     `Say *"My positions"* in 2–3 min to check your earnings\n` +
     `_(LI.FI takes a moment to index new deposits)_`,
   );

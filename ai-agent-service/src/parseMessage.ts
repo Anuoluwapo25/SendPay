@@ -1,4 +1,4 @@
-import type OpenAI from "openai";
+import OpenAI from "openai";
 import { createGroqClient, parseWithLlm } from "./llm.js";
 import { ruleParse } from "./ruleParser.js";
 import type { ParsedIntent } from "./schemas.js";

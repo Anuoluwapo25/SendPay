@@ -94,6 +94,8 @@ export type ComposerQuote = {
     executionDuration?: number;
     feeCosts?: ComposerFeeCost[];
     gasCosts?: ComposerFeeCost[];
+    /** Address the user must approve to spend fromToken before executing the deposit */
+    approvalAddress?: string;
   };
   transactionRequest: ComposerTransactionRequest;
 };
@@ -111,5 +113,10 @@ export type PendingYieldDeposit = {
   /** Gas estimates from LI.FI quote (hex strings) — used for pre-flight ETH balance check */
   txGasLimit?: string;
   txGasPrice?: string;
+  /**
+   * Address to approve for spending fromToken — from quote.estimate.approvalAddress.
+   * Required for ERC-20 deposits (e.g. USDC). Undefined for native token deposits.
+   */
+  approvalAddress?: string;
   createdAt: number;
 };
