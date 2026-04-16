@@ -3,7 +3,7 @@ import { createGroqClient, parseWithLlm } from "./llm.js";
 import { ruleParse } from "./ruleParser.js";
 import type { ParsedIntent } from "./schemas.js";
 
-type GroqClient = InstanceType<typeof OpenAI>;
+type GroqClient = OpenAI;
 
 export function createMessageParser(options?: {
   /** Groq client (OpenAI SDK with Groq base URL). Injected in tests. */
