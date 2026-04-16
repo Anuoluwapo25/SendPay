@@ -1,0 +1,9 @@
+{
+  "name": "sendpay",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build": "npm ci --prefix ai-agent-service && npm run build --prefix ai-agent-service",
+    "start": "npm run start --prefix ai-agent-service"
+  }
+}
