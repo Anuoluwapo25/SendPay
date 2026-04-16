@@ -1,0 +1,9 @@
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "build": {
+    "buildCommand": "cd ai-agent-service && npm install && npm run build"
+  },
+  "deploy": {
+    "startCommand": "cd ai-agent-service && node dist/index.js"
+  }
+}
