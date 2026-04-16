@@ -10,6 +10,21 @@
 import OpenAI from "openai";
 import type { Intent } from "../types.js";
 
+// TypeScript 5.8+ treats the default import of a merged class+namespace as a
+// namespace in type positions (TS2709/TS2351). Use a minimal interface instead.
+interface ChatClient {
+  chat: {
+    completions: {
+      create(params: {
+        model: string;
+        response_format?: { type: string };
+        messages: Array<{ role: string; content: string }>;
+        temperature?: number;
+      }): Promise<{ choices: Array<{ message: { content: string | null } }> }>;
+    };
+  };
+}
+
 const GROQ_BASE_URL = "https://api.groq.com/openai/v1";
 
 const SYSTEM = `You are a WhatsApp payment assistant intent parser for an app called SendrPay on Monad.
@@ -209,10 +224,11 @@ function ruleParse(text: string): Intent | null {
 
 // ── Groq LLM client ───────────────────────────────────────────────────────────
 
-function createGroqClient(): OpenAI | null {
+function createGroqClient(): ChatClient | null {
   const key = process.env.GROQ_API_KEY?.trim();
   if (!key) return null;
-  return new OpenAI({ apiKey: key, baseURL: GROQ_BASE_URL });
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return new (OpenAI as any)({ apiKey: key, baseURL: GROQ_BASE_URL }) as ChatClient;
 }
 
 const groqClient = createGroqClient();
