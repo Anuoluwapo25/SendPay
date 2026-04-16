@@ -4,6 +4,9 @@ const BASE     = "https://graph.facebook.com/v19.0";
 const PHONE_ID = process.env.WHATSAPP_PHONE_NUMBER_ID;
 const TOKEN    = process.env.WHATSAPP_ACCESS_TOKEN;
 
+if (!PHONE_ID) console.error("❌ WHATSAPP_PHONE_NUMBER_ID is not set");
+if (!TOKEN)    console.error("❌ WHATSAPP_ACCESS_TOKEN is not set");
+
 async function post(path: string, body: unknown): Promise<unknown> {
   const res = await fetch(`${BASE}/${path}`, {
     method: "POST",

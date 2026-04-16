@@ -231,7 +231,7 @@ webhookRouter.post("/", async (req: Request, res: Response) => {
     console.error(`Error handling message from ${phone}:`, err);
     try {
       await sendMessage(phone, ` Something went wrong: ${(err as Error).message}\n\nPlease try again or type *help*.`);
-    } catch { /* swallow — don't throw from webhook */ }
+    } catch (sendErr) { console.error("Failed to send error message to user:", sendErr); }
   }
 });
 
